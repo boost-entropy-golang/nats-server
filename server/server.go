@@ -42,6 +42,7 @@ import (
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nkeys"
 	"github.com/nats-io/nuid"
+	"golang.org/x/crypto/ocsp"
 
 	"github.com/nats-io/nats-server/v2/logger"
 )
@@ -1451,6 +1452,78 @@ func (s *Server) fetchAccount(name string) (*Account, error) {
 	return acc, nil
 }
 
+func (s *Server) startOCSPService() {
+	oc := s.getOpts().OCSPConfig
+	if oc == nil || oc.Mode == OCSPModeNever {
+		return
+	}
+
+	if oc.Mode == OCSPModeAuto && !hasOCSPStatusRequest(oc.Leaf) {
+		// "status_request" flag not set. No need to do anything.
+		s.Noticef("TLS certificate doesn't have 'status_request' flag set, not stapling status")
+		return
+	}
+
+	s.Noticef("Starting OCSP service")
+
+	var nextRun time.Duration
+	_, resp, err := oc.getLocalStatus()
+	if err == nil && resp.Status == ocsp.Good {
+		nextRun = oc.getNextRun()
+		t := resp.NextUpdate.Format(time.RFC3339Nano)
+		s.Noticef(
+			"Found existing OCSP certificate status: good, next update %s, checking again in %s",
+			t, nextRun,
+		)
+	} else if err == nil {
+		// If resp.Status is ocsp.Revoked, ocsp.Unknown, or any other value.
+		s.Errorf("Found existing OCSP certificate status: %s", ocspStatusString(resp.Status))
+		s.Shutdown()
+		return
+	}
+
+	for {
+		time.Sleep(nextRun)
+
+		s.mu.Lock()
+		running := s.running
+		shuttingDown := s.shutdown
+		s.mu.Unlock()
+		if !running && !shuttingDown {
+			// Server is probably still coming up. Wait a little more.
+			nextRun = 1 * time.Second
+			continue
+		}
+		if !running && shuttingDown {
+			// Server is shutting down. Exit goroutine.
+			s.Noticef("Shutting down OCSP service...")
+			return
+		}
+
+		_, resp, err := oc.getRemoteStatus()
+		if err != nil {
+			nextRun = oc.getNextRun()
+			s.Errorf("Bad OCSP status update: %s, trying again in %s", err, nextRun)
+			continue
+		}
+
+		switch n := resp.Status; n {
+		case ocsp.Good:
+			nextRun = oc.getNextRun()
+			t := resp.NextUpdate.Format(time.RFC3339Nano)
+			s.Noticef(
+				"Received OCSP certificate status: good, next update %s, checking again in %s",
+				t, nextRun,
+			)
+			continue
+		default:
+			s.Errorf("Received OCSP certificate status: %s, shutting down", ocspStatusString(n))
+			s.Shutdown()
+			return
+		}
+	}
+}
+
 // Start up the server, this will block.
 // Start via a Go routine if needed.
 func (s *Server) Start() {
@@ -1490,6 +1563,8 @@ func (s *Server) Start() {
 	if opts.ConfigFile != _EMPTY_ {
 		s.Noticef("Using configuration file: %s", opts.ConfigFile)
 	}
+
+	go s.startOCSPService()
 
 	hasOperators := len(opts.TrustedOperators) > 0
 	if hasOperators {

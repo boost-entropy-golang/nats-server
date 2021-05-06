@@ -30,6 +30,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -226,6 +227,7 @@ type Options struct {
 	TLSKey                string        `json:"-"`
 	TLSCaCert             string        `json:"-"`
 	TLSConfig             *tls.Config   `json:"-"`
+	OCSPConfig            *OCSPConfig   `json:"-"`
 	AllowNonTLS           bool          `json:"-"`
 	WriteDeadline         time.Duration `json:"-"`
 	MaxClosedClients      int           `json:"-"`
@@ -470,6 +472,10 @@ type TLSConfigOpts struct {
 	Timeout           float64
 	Ciphers           []uint16
 	CurvePreferences  []tls.CurveID
+
+	OCSPMode           OCSPMode
+	OCSPStatusDir      string
+	OCSPServerOverride []string
 }
 
 var tlsUsage = `
@@ -3694,6 +3700,75 @@ func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) er
 		}
 	}
 	return nil
+}
+
+// GenOCSPConfig loads TLS and OCSP related configuration parameters.
+func GenOCSPConfig(tco *TLSConfigOpts) (*tls.Config, *OCSPConfig, error) {
+	tc, err := GenTLSConfig(tco)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if tco.OCSPMode == OCSPModeNever {
+		return tc, nil, nil
+	}
+
+	cert, err := tls.LoadX509KeyPair(tco.CertFile, tco.KeyFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, nil, err
+	}
+	if tco.OCSPMode == OCSPModeAuto && !hasOCSPStatusRequest(cert.Leaf) {
+		// "status_request" flag not set. No need to do anything.
+		return tc, nil, nil
+	}
+
+	issuer, err := getOCSPIssuer(tco.CaFile, cert.Certificate)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Callbacks below will be in charge of returning the certificate instead,
+	// so this has to be nil.
+	tc.Certificates = nil
+
+	oc := &OCSPConfig{
+		mu:             new(sync.Mutex),
+		Leaf:           cert.Leaf,
+		Issuer:         issuer,
+		Mode:           tco.OCSPMode,
+		StatusDir:      tco.OCSPStatusDir,
+		ServerOverride: tco.OCSPServerOverride,
+	}
+
+	// GetCertificate returns a certificate that's presented to a
+	// client.
+	tc.GetCertificate = func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		raw, _, err := oc.getStatus()
+		if err != nil {
+			return nil, err
+		}
+
+		return &tls.Certificate{
+			Certificate:                  cert.Certificate,
+			PrivateKey:                   cert.PrivateKey,
+			SupportedSignatureAlgorithms: cert.SupportedSignatureAlgorithms,
+			OCSPStaple:                   raw,
+			SignedCertificateTimestamps:  cert.SignedCertificateTimestamps,
+			Leaf:                         cert.Leaf,
+		}, nil
+	}
+
+	// GetClientCertificate returns a certificate that's presented to a
+	// server.
+	tc.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		return &cert, nil
+	}
+
+	return tc, oc, nil
 }
 
 // GenTLSConfig loads TLS related configuration parameters.
