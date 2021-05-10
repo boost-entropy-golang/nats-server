@@ -28,9 +28,11 @@ const (
 )
 
 type OCSPConfig struct {
-	mu      *sync.Mutex
-	raw     []byte
-	resp    *ocsp.Response
+	hc *http.Client
+
+	mu   *sync.Mutex
+	raw  []byte
+	resp *ocsp.Response
 
 	Leaf           *x509.Certificate
 	Issuer         *x509.Certificate
@@ -130,11 +132,10 @@ func (oc *OCSPConfig) getRemoteStatus() ([]byte, *ocsp.Response, error) {
 		responders = oc.ServerOverride
 	}
 
-	hc := &http.Client{Timeout: 30 * time.Second}
 	var raw []byte
 	for _, u := range responders {
 		u = strings.TrimSuffix(u, "/")
-		raw, err = getRequestBytes(fmt.Sprintf("%s/%s", u, reqEnc), hc)
+		raw, err = getRequestBytes(fmt.Sprintf("%s/%s", u, reqEnc), oc.hc)
 		if err == nil {
 			break
 		}

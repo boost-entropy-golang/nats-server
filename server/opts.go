@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -3736,6 +3737,7 @@ func GenOCSPConfig(tco *TLSConfigOpts) (*tls.Config, *OCSPConfig, error) {
 	tc.Certificates = nil
 
 	oc := &OCSPConfig{
+		hc:             &http.Client{Timeout: 30 * time.Second},
 		mu:             new(sync.Mutex),
 		Leaf:           cert.Leaf,
 		Issuer:         issuer,
