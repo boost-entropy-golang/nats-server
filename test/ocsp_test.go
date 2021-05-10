@@ -50,6 +50,7 @@ func TestOCSP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	opts.OCSPConfig.MinWait = 1 * time.Second
 
 	doLog = true
 	s := RunServer(&opts)

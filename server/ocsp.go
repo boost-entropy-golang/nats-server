@@ -34,6 +34,9 @@ type OCSPConfig struct {
 	raw  []byte
 	resp *ocsp.Response
 
+	// MinWait is the minimum amount of time to wait between renewal attempts.
+	MinWait time.Duration
+
 	Leaf           *x509.Certificate
 	Issuer         *x509.Certificate
 	Mode           OCSPMode
@@ -43,18 +46,30 @@ type OCSPConfig struct {
 
 func (oc *OCSPConfig) getNextRun() time.Duration {
 	oc.mu.Lock()
-	nextUpdate := oc.resp.NextUpdate
+	lastValid := oc.resp
 	oc.mu.Unlock()
 
+	if lastValid == nil {
+		// We don't have any valid validity interval data yet, use default.
+		return oc.MinWait
+	}
+
 	now := time.Now()
-	if nextUpdate.IsZero() {
+	if lastValid.NextUpdate.IsZero() {
 		// If response is missing NextUpdate, we check the day after.
 		// Technically, if NextUpdate is missing, we can try whenever.
 		// https://tools.ietf.org/html/rfc6960#section-4.2.2.1
 		return 24 * time.Hour
 	}
 
-	return nextUpdate.Sub(now) / 2
+	// If we continuously fail, we cut the duration in half for each failure,
+	// down to a minimum. In the happy path, the Responder pushes NextUpdate to
+	// the future and the retry remain long.
+	next := lastValid.NextUpdate.Sub(now) / 2
+	if next < oc.MinWait {
+		next = oc.MinWait
+	}
+	return next
 }
 
 func (oc *OCSPConfig) getStatus() ([]byte, *ocsp.Response, error) {

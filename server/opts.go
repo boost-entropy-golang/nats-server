@@ -3739,6 +3739,7 @@ func GenOCSPConfig(tco *TLSConfigOpts) (*tls.Config, *OCSPConfig, error) {
 	oc := &OCSPConfig{
 		hc:             &http.Client{Timeout: 30 * time.Second},
 		mu:             new(sync.Mutex),
+		MinWait:        1 * time.Hour,
 		Leaf:           cert.Leaf,
 		Issuer:         issuer,
 		Mode:           tco.OCSPMode,
