@@ -1283,7 +1283,7 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 }
 
 func (s *Server) reloadOCSP() error {
-	opts := s.getOpts()
+	sopts := s.getOpts()
 
 	if err := s.setupOCSPStapleStoreDir(); err != nil {
 		return err
@@ -1294,22 +1294,52 @@ func (s *Server) reloadOCSP() error {
 	s.mu.Unlock()
 
 	// Stop all OCSP Stapling monitors in case there were any running.
-	var wasEnabled bool
 	for _, oc := range ocsps {
-		wasEnabled = true
 		oc.stop()
+	}
+
+	type ocspState struct {
+		config     *tls.Config
+		wasEnabled bool
+	}
+	withOCSP := make(map[string]ocspState)
+
+	// Start OCSP Stapling for client connections.
+	if config := sopts.TLSConfig; config != nil {
+		withOCSP[clientOCSP] = ocspState{config, true}
+	}
+	if config := sopts.Cluster.TLSConfig; config != nil {
+		withOCSP[clusterOCSP] = ocspState{config, true}
+	}
+	if config := sopts.LeafNode.TLSConfig; config != nil {
+		withOCSP[leafnodeOCSP] = ocspState{config, true}
+	}
+	if config := sopts.Gateway.TLSConfig; config != nil {
+		withOCSP[gatewayOCSP] = ocspState{config, true}
 	}
 
 	// Restart the monitors under the new configuration.
 	ocspm := make([]*OCSPMonitor, 0)
-	if config := opts.TLSConfig; config != nil {
-		tc, mon, err := s.NewOCSPMonitor(config)
+	// if config := opts.TLSConfig; config != nil {
+	for kind, config := range withOCSP {
+		tc, mon, err := s.NewOCSPMonitor(kind, config.config)
 		if err != nil {
 			return err
 		}
 		// Check if an OCSP stapling monitor is required for this certificate.
 		if mon != nil {
-			s.Noticef("OCSP Stapling enabled for client connections")
+			s.Noticef("OCSP Stapling enabled for %s connections", kind)
+			switch kind {
+			case clientOCSP:
+				sopts.TLSConfig = tc
+			case clusterOCSP:
+				sopts.Cluster.TLSConfig = tc
+			case leafnodeOCSP:
+				sopts.LeafNode.TLSConfig = tc
+			case gatewayOCSP:
+				sopts.Gateway.TLSConfig = tc
+			}
+
 			ocspm = append(ocspm, mon)
 
 			// Override the TLS config with one that has OCSP enabled.
@@ -1317,8 +1347,8 @@ func (s *Server) reloadOCSP() error {
 			s.opts.TLSConfig = tc
 			s.optsMu.Unlock()
 			s.startGoRoutine(func() { mon.run() })
-		} else if wasEnabled {
-			s.Warnf("OCSP Stapling disabled for client connections")
+		} else if config.wasEnabled {
+			s.Warnf("OCSP Stapling disabled for %s connections", kind)
 		}
 	}
 	// Replace stopped monitors with the new ones.

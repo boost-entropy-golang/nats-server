@@ -302,21 +302,36 @@ func (oc *OCSPMonitor) stop() {
 
 // NewOCSPMonitor takes a TLS configuration then wraps it with the callbacks set for OCSP verification
 // along with a monitor that will periodically fetch OCSP staples.
-func (srv *Server) NewOCSPMonitor(tc *tls.Config) (*tls.Config, *OCSPMonitor, error) {
+func (srv *Server) NewOCSPMonitor(kind string, tc *tls.Config) (*tls.Config, *OCSPMonitor, error) {
 	opts := srv.getOpts()
 	oc := opts.OCSPConfig
-	tcOpts := opts.tlsConfigOpts
 
-	var certFile, caFile string
+	// We need to track the CA certificate in case the CA is not present
+	// in the chain to be able to verify the signature of the OCSP staple.
+	var (
+		certFile string
+		caFile   string
+		tcOpts   *TLSConfigOpts
+	)
+	switch kind {
+	case clientOCSP:
+		tcOpts = opts.tlsConfigOpts
+		if opts.TLSCert != _EMPTY_ {
+			certFile = opts.TLSCert
+		}
+		if opts.TLSCaCert != _EMPTY_ {
+			caFile = opts.TLSCaCert
+		}
+	case clusterOCSP:
+		tcOpts = opts.Cluster.tlsConfigOpts
+	case leafnodeOCSP:
+		tcOpts = opts.LeafNode.tlsConfigOpts
+	case gatewayOCSP:
+		tcOpts = opts.Gateway.tlsConfigOpts
+	}
 	if tcOpts != nil {
 		certFile = tcOpts.CertFile
 		caFile = tcOpts.CaFile
-	}
-	if opts.TLSCert != _EMPTY_ {
-		certFile = opts.TLSCert
-	}
-	if opts.TLSCaCert != _EMPTY_ {
-		caFile = opts.TLSCaCert
 	}
 
 	// NOTE: Currently OCSP Stapling is enabled only for the first certificate found.
@@ -398,6 +413,38 @@ func (srv *Server) NewOCSPMonitor(tc *tls.Config) (*tls.Config, *OCSPMonitor, er
 				SignedCertificateTimestamps:  cert.SignedCertificateTimestamps,
 				Leaf:                         cert.Leaf,
 			}, nil
+		}
+
+		if kind == clusterOCSP || kind == gatewayOCSP {
+			// Also have to verify connection.
+			tc.VerifyConnection = func(s tls.ConnectionState) error {
+				if oresp := s.OCSPResponse; resp != nil {
+					// Client route connections will verify the response of
+					// the staple.
+					if len(s.VerifiedChains) == 0 {
+						return fmt.Errorf("missing TLS verified chains")
+					}
+					chain := s.VerifiedChains[0]
+
+					if got, want := len(chain), 2; got < want {
+						return fmt.Errorf("incomplete cert chain, got %d, want at least %d", got, want)
+					}
+					leaf, issuer := chain[0], chain[1]
+
+					resp, err := ocsp.ParseResponseForCert(oresp, leaf, issuer)
+					if err != nil {
+						return fmt.Errorf("failed to parse OCSP response: %w", err)
+					}
+					if err := resp.CheckSignatureFrom(issuer); err != nil {
+						return err
+					}
+					if resp.Status != ocsp.Good {
+						return fmt.Errorf("bad status for OCSP Staple")
+					}
+				}
+				return nil
+			}
+
 		}
 
 		// GetClientCertificate returns a certificate that's presented to a

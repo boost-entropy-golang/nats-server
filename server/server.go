@@ -1488,15 +1488,16 @@ func (s *Server) setupOCSPStapleStoreDir() error {
 	return nil
 }
 
+const (
+	clientOCSP   = "client"
+	clusterOCSP  = "cluster"
+	leafnodeOCSP = "leafnode"
+	gatewayOCSP  = "gateway"
+)
+
+// FIXME: Add support for MQTT and WebSocket
 func (s *Server) enableOCSP() error {
 	sopts := s.getOpts()
-
-	const (
-		clientOCSP   = "client"
-		clusterOCSP  = "cluster"
-		leafnodeOCSP = "leafnode"
-		gatewayOCSP  = "gateway"
-	)
 
 	withOCSP := make(map[string]*tls.Config)
 
@@ -1514,10 +1515,12 @@ func (s *Server) enableOCSP() error {
 		withOCSP[gatewayOCSP] = config
 	}
 
-	// FIXME: Add support for MQTT and WebSocket
 	for kind, config := range withOCSP {
-		tc, mon, err := s.NewOCSPMonitor(config)
+		myconf := config
+		tc, mon, err := s.NewOCSPMonitor(kind, myconf)
+		fmt.Println(kind, tc, mon)
 		if err != nil {
+			// There should be no OCSP Stapling errors on boot.
 			return err
 		}
 		// Check if an OCSP stapling monitor is required for this certificate.
@@ -1539,6 +1542,7 @@ func (s *Server) enableOCSP() error {
 			s.startGoRoutine(func() { mon.run() })
 		}
 	}
+
 	return nil
 }
 

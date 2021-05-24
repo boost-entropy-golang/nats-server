@@ -1000,7 +1000,8 @@ func TestOCSPClusterReload(t *testing.T) {
 			timeout: 5
 		}
 		store_dir: "%s"
-		cluster { 
+		cluster {
+			name: AB
 			port: -1
 
 			tls {
@@ -1029,6 +1030,7 @@ func TestOCSPClusterReload(t *testing.T) {
 		}
 		store_dir: "%s"
 		cluster { 
+			name: AB
 			port: -1
 
 			routes: [ nats://localhost:%d ]
