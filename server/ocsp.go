@@ -246,12 +246,12 @@ func (oc *OCSPMonitor) run() {
 		nextRun = oc.getNextRun()
 		t := resp.NextUpdate.Format(time.RFC3339Nano)
 		s.Noticef(
-			"Found existing OCSP status for certificate at '%s': good, next update %s, checking again in %s",
+			"Found OCSP status for certificate at '%s': good, next update %s, checking again in %s",
 			certFile, t, nextRun,
 		)
 	} else if err == nil && shutdownOnRevoke {
 		// If resp.Status is ocsp.Revoked, ocsp.Unknown, or any other value.
-		s.Errorf("Found existing OCSP status for certificate at '%s': %s", certFile, ocspStatusString(resp.Status))
+		s.Errorf("Found OCSP status for certificate at '%s': %s", certFile, ocspStatusString(resp.Status))
 		s.Shutdown()
 		return
 	}

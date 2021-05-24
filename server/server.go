@@ -1489,26 +1489,56 @@ func (s *Server) setupOCSPStapleStoreDir() error {
 }
 
 func (s *Server) enableOCSP() error {
-	opts := s.getOpts()
+	sopts := s.getOpts()
+
+	const (
+		clientOCSP   = "client"
+		clusterOCSP  = "cluster"
+		leafnodeOCSP = "leafnode"
+		gatewayOCSP  = "gateway"
+	)
+
+	withOCSP := make(map[string]*tls.Config)
 
 	// Start OCSP Stapling for client connections.
-	if config := opts.TLSConfig; config != nil {
+	if config := sopts.TLSConfig; config != nil {
+		withOCSP[clientOCSP] = config
+	}
+	if config := sopts.Cluster.TLSConfig; config != nil {
+		withOCSP[clusterOCSP] = config
+	}
+	if config := sopts.LeafNode.TLSConfig; config != nil {
+		withOCSP[leafnodeOCSP] = config
+	}
+	if config := sopts.Gateway.TLSConfig; config != nil {
+		withOCSP[gatewayOCSP] = config
+	}
+
+	// FIXME: Add support for MQTT and WebSocket
+	for kind, config := range withOCSP {
 		tc, mon, err := s.NewOCSPMonitor(config)
 		if err != nil {
 			return err
 		}
 		// Check if an OCSP stapling monitor is required for this certificate.
 		if mon != nil {
-			s.Noticef("OCSP Stapling enabled for client connections")
+			s.Noticef("OCSP Stapling enabled for %s connections", kind)
 
 			s.ocsps = append(s.ocsps, mon)
 			// Override the TLS config with one that follows OCSP.
-			opts.TLSConfig = tc
+			switch kind {
+			case clientOCSP:
+				sopts.TLSConfig = tc
+			case clusterOCSP:
+				sopts.Cluster.TLSConfig = tc
+			case leafnodeOCSP:
+				sopts.LeafNode.TLSConfig = tc
+			case gatewayOCSP:
+				sopts.Gateway.TLSConfig = tc
+			}
 			s.startGoRoutine(func() { mon.run() })
 		}
 	}
-	// FIXME: Add support for leafnodes, routes, gateways, MQTT, WebSocket
-
 	return nil
 }
 
