@@ -385,11 +385,9 @@ func (srv *Server) NewOCSPMonitor(kind string, tc *tls.Config) (*tls.Config, *OC
 		}
 
 		// Get the certificate status from the memory, then remote OCSP responder.
-		_, resp, err := mon.getStatus()
-		if err != nil {
+		if _, resp, err := mon.getStatus(); err != nil {
 			return nil, nil, fmt.Errorf("bad OCSP status update for certificate at '%s': %s", certFile, err)
-		}
-		if err == nil && resp.Status != ocsp.Good && shutdownOnRevoke {
+		} else if err == nil && resp != nil && resp.Status != ocsp.Good && shutdownOnRevoke {
 			return nil, nil, fmt.Errorf("found existing OCSP status for certificate at '%s': %s", certFile, ocspStatusString(resp.Status))
 		}
 
@@ -417,8 +415,8 @@ func (srv *Server) NewOCSPMonitor(kind string, tc *tls.Config) (*tls.Config, *OC
 
 		if kind == clusterOCSP || kind == gatewayOCSP {
 			// Also have to verify connection.
-			tc.VerifyConnection = func(s tls.ConnectionState) error {
-				if oresp := s.OCSPResponse; resp != nil {
+			tc.VerifyConnection = func(s tls.ConnectionState) (namedErr error) {
+				if oresp := s.OCSPResponse; oresp != nil {
 					// Client route connections will verify the response of
 					// the staple.
 					if len(s.VerifiedChains) == 0 {
