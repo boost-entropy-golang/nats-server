@@ -4978,7 +4978,7 @@ func (c *client) doTLSHandshake(typ string, solicit bool, url *url.URL, tlsConfi
 			tlsConfig = tlsConfig.Clone()
 			tlsConfig.VerifyConnection = func(s tls.ConnectionState) (namedErr error) {
 				oresp := s.OCSPResponse
-				if oresp != nil {
+				if oresp == nil {
 					return fmt.Errorf("Must Staple!!!")
 				}
 
