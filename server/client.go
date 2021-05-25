@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
+	"golang.org/x/crypto/ocsp"
 )
 
 // Type of client connection.
@@ -266,8 +267,9 @@ type client struct {
 	echo  bool
 	noIcb bool
 
-	tags    jwt.TagList
-	nameTag string
+	tags       jwt.TagList
+	nameTag    string
+	mustStaple bool
 }
 
 type rrTracking struct {
@@ -620,6 +622,11 @@ func (c *client) initClient() {
 		c.ncs.Store("JETSTREAM")
 	case ACCOUNT:
 		c.ncs.Store("ACCOUNT")
+	}
+
+	// TODO: Move this from here to avoid race.
+	if s.ocsps != nil {
+		c.mustStaple = true
 	}
 }
 
@@ -4950,6 +4957,7 @@ func (c *client) doTLSHandshake(typ string, solicit bool, url *url.URL, tlsConfi
 
 	// Capture kind for some debug/error statements.
 	kind := c.kind
+	mustStaple := c.mustStaple
 
 	// If we solicited, we will act like the client, otherwise the server.
 	if solicit {
@@ -4964,6 +4972,44 @@ func (c *client) doTLSHandshake(typ string, solicit bool, url *url.URL, tlsConfi
 			}
 			tlsConfig.ServerName = host
 		}
+		// Check if OCSP Stapling is enabled for this type of connections, and if so
+		// then have to verify the signature of the staple.
+		if mustStaple {
+			tlsConfig = tlsConfig.Clone()
+			tlsConfig.VerifyConnection = func(s tls.ConnectionState) (namedErr error) {
+				oresp := s.OCSPResponse
+				if oresp != nil {
+					return fmt.Errorf("Must Staple!!!")
+				}
+
+				// Client route connections will verify the response of
+				// the staple.
+				if len(s.VerifiedChains) == 0 {
+					return fmt.Errorf("missing TLS verified chains")
+				}
+				chain := s.VerifiedChains[0]
+
+				if got, want := len(chain), 2; got < want {
+					return fmt.Errorf("incomplete cert chain, got %d, want at least %d", got, want)
+				}
+
+				// TODO: Support issuer cert not being in the chain using ca_file.
+				leaf, issuer := chain[0], chain[1]
+
+				resp, err := ocsp.ParseResponseForCert(oresp, leaf, issuer)
+				if err != nil {
+					return fmt.Errorf("failed to parse OCSP response: %w", err)
+				}
+				if err := resp.CheckSignatureFrom(issuer); err != nil {
+					return err
+				}
+				if resp.Status != ocsp.Good {
+					return fmt.Errorf("bad status for OCSP Staple")
+				}
+				return nil
+			}
+		}
+
 		c.nc = tls.Client(c.nc, tlsConfig)
 	} else {
 		if kind == CLIENT {
@@ -4971,6 +5017,12 @@ func (c *client) doTLSHandshake(typ string, solicit bool, url *url.URL, tlsConfi
 		} else {
 			c.Debugf("Starting TLS %s server handshake", typ)
 		}
+
+		// If we are the server, we do not need to verify the connection.
+		// if tlsConfig.VerifyConnection != nil {
+		// 	tlsConfig = tlsConfig.Clone()
+		// 	tlsConfig.VerifyConnection = nil
+		// }
 		c.nc = tls.Server(c.nc, tlsConfig)
 	}
 

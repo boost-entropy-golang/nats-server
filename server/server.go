@@ -237,6 +237,7 @@ type Server struct {
 	mqtt srvMQTT
 
 	// OCSP monitoring
+	// ocsps map[string][]*OCSPMonitor
 	ocsps []*OCSPMonitor
 
 	// exporting account name the importer experienced issues with
