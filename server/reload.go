@@ -1014,6 +1014,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			tmpNew := newValue.(GatewayOpts)
 			tmpOld.TLSConfig = nil
 			tmpNew.TLSConfig = nil
+			tmpOld.tlsConfigOpts = nil
+			tmpNew.tlsConfigOpts = nil
 
 			// Need to do the same for remote gateways' TLS configs.
 			// But we can't just set remotes' TLSConfig to nil otherwise this
