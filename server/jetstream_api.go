@@ -608,6 +608,7 @@ const JSApiConsumerListResponseType = "io.nats.jetstream.api.v1.consumer_list_re
 type JSApiConsumerGetNextRequest struct {
 	Expires   time.Duration `json:"expires,omitempty"`
 	Batch     int           `json:"batch,omitempty"`
+	MaxBytes  int           `json:"max_bytes,omitempty"`
 	NoWait    bool          `json:"no_wait,omitempty"`
 	Heartbeat time.Duration `json:"idle_heartbeat,omitempty"`
 }
@@ -1211,6 +1212,7 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, _ *Account,
 		}
 		return
 	}
+
 	var cfg StreamConfig
 	if err := json.Unmarshal(msg, &cfg); err != nil {
 		resp.Error = NewJSInvalidJSONError()
@@ -1230,6 +1232,41 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, _ *Account,
 		resp.Error = NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration for create can not be sealed"))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
+	}
+
+	// If we have a republish directive check if we can create a transform here.
+	if cfg.RePublish != nil {
+		// Check to make sure source is a valid subset of the subjects we have.
+		// Also make sure it does not form a cycle.
+		var srcValid bool
+		for _, subj := range cfg.Subjects {
+			if SubjectsCollide(cfg.RePublish.Source, subj) {
+				srcValid = true
+				break
+			}
+		}
+		if !srcValid {
+			resp.Error = NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration for republish source is not valid subset of subjects"))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+		var formsCycle bool
+		for _, subj := range cfg.Subjects {
+			if SubjectsCollide(cfg.RePublish.Destination, subj) {
+				formsCycle = true
+				break
+			}
+		}
+		if formsCycle {
+			resp.Error = NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration for republish destination forms a cycle"))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+		if _, err := newTransform(cfg.RePublish.Source, cfg.RePublish.Destination); err != nil {
+			resp.Error = NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration for republish not valid"))
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
 	}
 
 	// Hand off to cluster for processing.
@@ -3246,6 +3283,13 @@ func (s *Server) jsConsumerCreate(sub *subscription, c *client, a *Account, subj
 
 	if isClustered && !req.Config.Direct {
 		s.jsClusteredConsumerRequest(ci, acc, subject, reply, rmsg, req.Stream, &req.Config)
+		return
+	}
+
+	// If we are here we are single server mode.
+	if req.Config.Replicas > 1 {
+		resp.Error = NewJSStreamReplicasNotSupportedError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
