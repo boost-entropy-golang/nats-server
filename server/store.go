@@ -103,6 +103,8 @@ type StreamStore interface {
 	Delete() error
 	Stop() error
 	ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerStore, error)
+	AddConsumer(o ConsumerStore) error
+	RemoveConsumer(o ConsumerStore) error
 	Snapshot(deadline time.Duration, includeConsumers, checkMsgs bool) (*SnapshotResult, error)
 	Utilization() (total, reported uint64, err error)
 }
@@ -168,6 +170,8 @@ type SnapshotResult struct {
 
 // ConsumerStore stores state on consumers for streams.
 type ConsumerStore interface {
+	SetStarting(sseq uint64) error
+	HasState() bool
 	UpdateDelivered(dseq, sseq, dc uint64, ts int64) error
 	UpdateAcks(dseq, sseq uint64) error
 	UpdateConfig(cfg *ConsumerConfig) error

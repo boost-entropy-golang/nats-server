@@ -3746,10 +3746,15 @@ func TestNoRaceJetStreamClusterMaxConsumersAndDirect(t *testing.T) {
 // Make sure when we try to hard reset a stream state in a cluster that we also re-create the consumers.
 func TestNoRaceJetStreamClusterStreamReset(t *testing.T) {
 	// Speed up raft
+	omin, omax, ohb := minElectionTimeout, maxElectionTimeout, hbInterval
 	minElectionTimeout = 250 * time.Millisecond
 	maxElectionTimeout = time.Second
 	hbInterval = 50 * time.Millisecond
-	defer setDefaultRaftTimeouts()
+	defer func() {
+		minElectionTimeout = omin
+		maxElectionTimeout = omax
+		hbInterval = ohb
+	}()
 
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -3848,61 +3853,6 @@ func TestNoRaceJetStreamClusterStreamReset(t *testing.T) {
 
 	c.waitOnStreamLeader("$G", "TEST")
 	c.waitOnConsumerLeader("$G", "TEST", "d1")
-}
-
-// Issue #2644
-func TestNoRaceJetStreamPullConsumerAPIOutUnlock(t *testing.T) {
-	c := createJetStreamClusterExplicit(t, "R3S", 3)
-	defer c.shutdown()
-
-	// Client based API
-	nc, js := jsClientConnect(t, c.randomServer())
-	defer nc.Close()
-
-	_, err := js.AddStream(&nats.StreamConfig{
-		Name:      "TEST",
-		Subjects:  []string{"foo"},
-		Retention: nats.WorkQueuePolicy,
-	})
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	if _, err = js.PullSubscribe("foo", "dlc"); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	for i := 0; i < 100; i++ {
-		if _, err := js.PublishAsync("foo", []byte("OK")); err != nil {
-			t.Fatalf("Unexpected publish error: %v", err)
-		}
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
-
-	// Force to go through route to use the Go routines, etc.
-	s := c.randomStreamNotAssigned("$G", "TEST")
-	if s == nil {
-		t.Fatalf("Did not get a server")
-	}
-
-	nc, _ = jsClientConnect(t, s)
-	defer nc.Close()
-
-	// Set this low to trigger error.
-	maxJSApiOut = 5
-	defer func() { maxJSApiOut = defaultMaxJSApiOut }()
-
-	nsubj := fmt.Sprintf(JSApiRequestNextT, "TEST", "dlc")
-	for i := 0; i < 500; i++ {
-		if err := nc.PublishRequest(nsubj, "bar", nil); err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-	}
-	nc.Flush()
 }
 
 // Reports of high cpu on compaction for a KV store.
@@ -5182,6 +5132,101 @@ func TestNoRaceJetStreamPullConsumersAndInteriorDeletes(t *testing.T) {
 		// OK
 	case <-time.After(20 * time.Second):
 		t.Fatalf("Consumers took too long to consumer all messages")
+	}
+}
+
+func TestNoRaceJetStreamClusterInterestPullConsumerStreamLimitBug(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.InterestPolicy,
+		MaxMsgs:   2000,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "dur", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	qch := make(chan bool)
+	var wg sync.WaitGroup
+
+	// Publisher
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			pt := time.NewTimer(time.Duration(rand.Intn(2)) * time.Millisecond)
+			select {
+			case <-pt.C:
+				_, err := js.Publish("foo", []byte("BUG!"))
+				if err != nil {
+					t.Logf("Got a publisher error: %v", err)
+					return
+				}
+			case <-qch:
+				return
+			}
+		}
+	}()
+
+	time.Sleep(time.Second)
+
+	// Pull Consumers
+	wg.Add(100)
+	for i := 0; i < 100; i++ {
+		go func() {
+			defer wg.Done()
+			_, js := jsClientConnect(t, c.randomServer())
+			sub, err := js.PullSubscribe("foo", "dur")
+			require_NoError(t, err)
+
+			for {
+				pt := time.NewTimer(time.Duration(rand.Intn(300)) * time.Millisecond)
+				select {
+				case <-pt.C:
+					msgs, err := sub.Fetch(1)
+					if err != nil {
+						t.Logf("Got a Fetch error: %v", err)
+						return
+					}
+					if len(msgs) > 0 {
+						go func() {
+							ackDelay := time.Duration(rand.Intn(375)+15) * time.Millisecond
+							m := msgs[0]
+							time.AfterFunc(ackDelay, func() { m.AckSync() })
+						}()
+					}
+				case <-qch:
+					return
+				}
+			}
+		}()
+	}
+
+	time.Sleep(5 * time.Second)
+	close(qch)
+	wg.Wait()
+	time.Sleep(time.Second)
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	ci, err := js.ConsumerInfo("TEST", "dur")
+	require_NoError(t, err)
+
+	ld := ci.Delivered.Stream
+	if si.State.FirstSeq > ld {
+		ld = si.State.FirstSeq - 1
+	}
+	if si.State.LastSeq-ld != ci.NumPending {
+		t.Fatalf("Expected NumPending to be %d got %d", si.State.LastSeq-ld, ci.NumPending)
 	}
 }
 

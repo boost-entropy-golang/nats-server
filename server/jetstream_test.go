@@ -2917,8 +2917,9 @@ func TestJetStreamWorkQueueNakRedelivery(t *testing.T) {
 
 			// Grab #6
 			m := getMsg(6, 6)
-			// NAK this one.
+			// NAK this one and make sure its processed.
 			m.Respond(AckNak)
+			nc.Flush()
 
 			// When we request again should be store sequence 6 again.
 			getMsg(6, 7)
@@ -5547,6 +5548,7 @@ func TestJetStreamRedeliverCount(t *testing.T) {
 
 				// Make sure it keeps getting sent back.
 				m.Respond(AckNak)
+				nc.Flush()
 			}
 		})
 	}
@@ -5589,7 +5591,7 @@ func TestJetStreamRedeliverAndLateAck(t *testing.T) {
 	// Wait for past ackwait time
 	time.Sleep(150 * time.Millisecond)
 	// Now ack!
-	msg.Respond(nil)
+	msg.AckSync()
 	// We should not get this back.
 	if _, err := nc.Request(nextSubj, nil, 10*time.Millisecond); err == nil {
 		t.Fatalf("Message should not have been sent back")
@@ -17521,23 +17523,227 @@ func TestJetStreamStreamRepublishCycle(t *testing.T) {
 		}
 	}
 
-	cfg.RePublish = &SubjectMapping{
+	cfg.RePublish = &RePublish{
 		Source:      "foo.>",
 		Destination: "foo.>",
 	}
 	expectFail()
 
-	cfg.RePublish = &SubjectMapping{
+	cfg.RePublish = &RePublish{
 		Source:      "bar.bar",
 		Destination: "foo.bar",
 	}
 	expectFail()
 
-	cfg.RePublish = &SubjectMapping{
+	cfg.RePublish = &RePublish{
 		Source:      "baz",
 		Destination: "bar.bar",
 	}
 	expectFail()
+}
+
+func TestJetStreamStreamRepublishHeadersOnly(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Do by hand for now.
+	cfg := &StreamConfig{
+		Name:     "RPC",
+		Storage:  MemoryStorage,
+		Subjects: []string{"foo", "bar", "baz"},
+		RePublish: &RePublish{
+			Destination: "RP.>",
+			HeadersOnly: true,
+		},
+	}
+	addStream(t, nc, cfg)
+
+	sub, err := nc.SubscribeSync("RP.>")
+	require_NoError(t, err)
+
+	msg, toSend := bytes.Repeat([]byte("Z"), 512), 100
+	for i := 0; i < toSend; i++ {
+		js.PublishAsync("foo", msg)
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	checkSubsPending(t, sub, toSend)
+	m, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+
+	if len(m.Data) > 0 {
+		t.Fatalf("Expected no msg just headers, but got %d bytes", len(m.Data))
+	}
+	if sz := m.Header.Get(JSMsgSize); sz != "512" {
+		t.Fatalf("Expected msg size hdr, got %q", sz)
+	}
+}
+
+func TestJetStreamConsumerDeliverNewNotConsumingBeforeRestart(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	inbox := nats.NewInbox()
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		DeliverSubject: inbox,
+		Durable:        "dur",
+		AckPolicy:      nats.AckExplicitPolicy,
+		DeliverPolicy:  nats.DeliverNewPolicy,
+		FilterSubject:  "foo",
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+
+	checkCount := func(expected int) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			ci, err := js.ConsumerInfo("TEST", "dur")
+			if err != nil {
+				return err
+			}
+			if n := int(ci.NumPending); n != expected {
+				return fmt.Errorf("Expected %v pending, got %v", expected, n)
+			}
+			return nil
+		})
+	}
+	checkCount(10)
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Check server restart
+	nc.Close()
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+	// Restart.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	checkCount(10)
+
+	// Make sure messages can be consumed
+	sub := natsSubSync(t, nc, inbox)
+	for i := 0; i < 10; i++ {
+		msg, err := sub.NextMsg(time.Second)
+		if err != nil {
+			t.Fatalf("i=%v next msg error: %v", i, err)
+		}
+		msg.AckSync()
+	}
+	checkCount(0)
+}
+
+func TestJetStreamConsumerNumPendingWithMaxPerSubjectGreaterThanOne(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	test := func(t *testing.T, st nats.StorageType) {
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"KV.*.*"},
+			MaxMsgsPerSubject: 2,
+			Storage:           st,
+		})
+		require_NoError(t, err)
+
+		// If we allow more than one msg per subject, consumer's num pending can be off (bug in store level).
+		// This requires a filtered state, simple states work ok.
+		// Since we now rely on stream's filtered state when asked directly for consumer info in >=2.8.3.
+		js.PublishAsync("KV.plans.foo", []byte("OK"))
+		js.PublishAsync("KV.plans.bar", []byte("OK"))
+		js.PublishAsync("KV.plans.baz", []byte("OK"))
+		// These are required, the consumer needs to filter these out to see the bug.
+		js.PublishAsync("KV.config.foo", []byte("OK"))
+		js.PublishAsync("KV.config.bar", []byte("OK"))
+		js.PublishAsync("KV.config.baz", []byte("OK"))
+
+		// Double up some now.
+		js.PublishAsync("KV.plans.bar", []byte("OK"))
+		js.PublishAsync("KV.plans.baz", []byte("OK"))
+
+		ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:       "d",
+			AckPolicy:     nats.AckExplicitPolicy,
+			DeliverPolicy: nats.DeliverLastPerSubjectPolicy,
+			FilterSubject: "KV.plans.*",
+		})
+		require_NoError(t, err)
+
+		err = js.DeleteStream("TEST")
+		require_NoError(t, err)
+
+		if ci.NumPending != 3 {
+			t.Fatalf("Expected 3 NumPending, but got %d", ci.NumPending)
+		}
+	}
+
+	t.Run("MemoryStore", func(t *testing.T) { test(t, nats.MemoryStorage) })
+	t.Run("FileStore", func(t *testing.T) { test(t, nats.FileStorage) })
+}
+
+func TestJetStreamMsgGetNoAdvisory(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "foo"})
+	require_NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		js.PublishAsync("foo", []byte("ok"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	sub, err := nc.SubscribeSync("$JS.EVENT.ADVISORY.>")
+	require_NoError(t, err)
+
+	_, err = js.GetMsg("foo", 1)
+	require_NoError(t, err)
+
+	checkSubsPending(t, sub, 0)
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -17845,4 +18051,86 @@ func TestJetStreamKVMemoryStorePerf(t *testing.T) {
 		require_NoError(t, err)
 	}
 	fmt.Printf("Took %v for second run\n", time.Since(start))
+}
+
+func TestJetStreamMultiplePullPerf(t *testing.T) {
+	skip(t)
+
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	js.AddStream(&nats.StreamConfig{Name: "mp22", Storage: nats.FileStorage})
+	defer js.DeleteStream("mp22")
+
+	n, msg := 1_000_000, []byte("OK")
+	for i := 0; i < n; i++ {
+		js.PublishAsync("mp22", msg)
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	si, err := js.StreamInfo("mp22")
+	require_NoError(t, err)
+
+	fmt.Printf("msgs: %d, total_bytes: %v\n", si.State.Msgs, friendlyBytes(int64(si.State.Bytes)))
+
+	// 10 pull subscribers each asking for 100 msgs.
+	_, err = js.AddConsumer("mp22", &nats.ConsumerConfig{
+		Durable:       "d",
+		MaxAckPending: 8_000,
+		AckPolicy:     nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	startCh := make(chan bool)
+	var wg sync.WaitGroup
+
+	np, bs := 10, 100
+
+	count := 0
+
+	for i := 0; i < np; i++ {
+		_, js := jsClientConnect(t, s)
+		sub, err := js.PullSubscribe("mp22", "d")
+		require_NoError(t, err)
+
+		wg.Add(1)
+		go func(sub *nats.Subscription) {
+			defer wg.Done()
+			<-startCh
+			for i := 0; i < n/(np*bs); i++ {
+				msgs, err := sub.Fetch(bs)
+				if err != nil {
+					t.Logf("Got error on pull: %v", err)
+					return
+				}
+				if len(msgs) != bs {
+					t.Logf("Expected %d msgs, got %d", bs, len(msgs))
+					return
+				}
+				count += len(msgs)
+				for _, m := range msgs {
+					m.Ack()
+				}
+			}
+		}(sub)
+	}
+
+	start := time.Now()
+	close(startCh)
+	wg.Wait()
+
+	tt := time.Since(start)
+	fmt.Printf("Took %v to receive %d msgs [%d]\n", tt, n, count)
+	fmt.Printf("%.0f msgs/s\n", float64(n)/tt.Seconds())
+	fmt.Printf("%.0f mb/s\n\n", float64(si.State.Bytes/(1024*1024))/tt.Seconds())
 }

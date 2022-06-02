@@ -223,8 +223,8 @@ type consumer struct {
 	dseq              uint64
 	adflr             uint64
 	asflr             uint64
-	sgap              uint64
-	lsgap             uint64
+	npc               uint64
+	npcm              uint64
 	dsubj             string
 	qgroup            string
 	lss               *lastSeqSkipList
@@ -690,9 +690,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		return nil, NewJSConsumerBadDurableNameError()
 	}
 
-	// Select starting sequence number
-	o.selectStartingSeqNo()
-
+	// Setup our storage if not a direct consumer.
 	if !config.Direct {
 		store, err := mset.store.ConsumerStore(o.name, config)
 		if err != nil {
@@ -701,6 +699,14 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 			return nil, NewJSConsumerStoreFailedError(err)
 		}
 		o.store = store
+	}
+
+	if o.store != nil && o.store.HasState() {
+		// Restore our saved state.
+		o.readStoredState(0)
+	} else {
+		// Select starting sequence number
+		o.selectStartingSeqNo()
 	}
 
 	// Now register with mset and create the ack subscription.
@@ -882,10 +888,22 @@ func (o *consumer) setLeader(isLeader bool) {
 
 		o.mu.Lock()
 		o.rdq, o.rdqi = nil, nil
+
 		// Restore our saved state. During non-leader status we just update our underlying store.
-		hadState, _ := o.readStoredState(lseq)
-		// Setup initial pending and proper start sequence.
-		o.setInitialPendingAndStart(hadState)
+		o.readStoredState(lseq)
+
+		// Setup initial num pending.
+		o.streamNumPending()
+
+		// Cleanup lss when we take over in clustered mode.
+		if o.hasSkipListPending() && o.sseq >= o.lss.resume {
+			o.lss = nil
+		}
+
+		// Update the group on the our starting sequence if we are starting but we skipped some in the stream.
+		if o.dseq == 1 && o.sseq > 1 {
+			o.updateSkipped()
+		}
 
 		// Do info sub.
 		if o.infoSub == nil && jsa != nil {
@@ -962,6 +980,9 @@ func (o *consumer) setLeader(isLeader bool) {
 
 		// Now start up Go routine to deliver msgs.
 		go o.loopAndGatherMsgs(qch)
+
+		// Now start up Go routine to process acks.
+		go o.processInboundAcks(qch)
 
 		// If we are R>1 spin up our proposal loop.
 		if node != nil {
@@ -1928,19 +1949,18 @@ func (o *consumer) checkRedelivered(slseq uint64) {
 
 // This will restore the state from disk.
 // Lock should be held.
-func (o *consumer) readStoredState(slseq uint64) (hadState bool, err error) {
+func (o *consumer) readStoredState(slseq uint64) error {
 	if o.store == nil {
-		return false, nil
+		return nil
 	}
 	state, err := o.store.State()
-	if err == nil && state != nil && (state.Delivered.Consumer != 0 || state.Delivered.Stream != 0) {
+	if err == nil {
 		o.applyState(state)
-		hadState = true
 		if len(o.rdc) > 0 {
 			o.checkRedelivered(slseq)
 		}
 	}
-	return hadState, err
+	return err
 }
 
 // Apply the consumer stored state.
@@ -1949,8 +1969,12 @@ func (o *consumer) applyState(state *ConsumerState) {
 		return
 	}
 
+	// If o.sseq is greater don't update. Don't go backwards on o.sseq.
+	if o.sseq <= state.Delivered.Stream {
+		o.sseq = state.Delivered.Stream + 1
+	}
 	o.dseq = state.Delivered.Consumer + 1
-	o.sseq = state.Delivered.Stream + 1
+
 	o.adflr = state.AckFloor.Consumer
 	o.asflr = state.AckFloor.Stream
 	o.pending = state.Pending
@@ -2067,7 +2091,7 @@ func (o *consumer) infoWithSnap(snap bool) *ConsumerInfo {
 		},
 		NumAckPending:  len(o.pending),
 		NumRedelivered: len(o.rdc),
-		NumPending:     o.adjustedPending(),
+		NumPending:     o.streamNumPending(),
 		PushBound:      o.isPushMode() && o.active,
 		Cluster:        ci,
 	}
@@ -2083,7 +2107,7 @@ func (o *consumer) infoWithSnap(snap bool) *ConsumerInfo {
 
 	// If we are a pull mode consumer, report on number of waiting requests.
 	if o.isPullMode() {
-		o.processWaiting()
+		o.processWaiting(false)
 		info.NumWaiting = o.waiting.len()
 	}
 	// If we were asked to snapshot do so here.
@@ -2225,7 +2249,7 @@ func (o *consumer) processAckMsg(sseq, dseq, dc uint64, doSample bool) {
 		}
 	}
 
-	// If we had max ack pending set and were at limit we need to unblock folks.
+	// If we had max ack pending set and were at limit we need to unblock ourselves.
 	if needSignal {
 		o.signalNewMessages()
 	}
@@ -2625,12 +2649,12 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	// If we have the max number of requests already pending try to expire.
 	if o.waiting.isFull() {
 		// Try to expire some of the requests.
-		o.processWaiting()
+		o.processWaiting(false)
 	}
 
 	// If the request is for noWait and we have pending requests already, check if we have room.
 	if noWait {
-		msgsPending := o.adjustedPending() + uint64(len(o.rdq))
+		msgsPending := o.numPending() + uint64(len(o.rdq))
 		// If no pending at all, decide what to do with request.
 		// If no expires was set then fail.
 		if msgsPending == 0 && expires.IsZero() {
@@ -2638,7 +2662,7 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 			return
 		}
 		if msgsPending > 0 {
-			_, _, batchPending, _ := o.processWaiting()
+			_, _, batchPending, _ := o.processWaiting(false)
 			if msgsPending < uint64(batchPending) {
 				sendErr(408, "Requests Pending")
 				return
@@ -2813,7 +2837,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 
 // Will check for expiration and lack of interest on waiting requests.
 // Will also do any heartbeats and return the next expiration or HB interval.
-func (o *consumer) processWaiting() (int, int, int, time.Time) {
+func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 	var fexp time.Time
 	if o.srv == nil || o.waiting.isEmpty() {
 		return 0, 0, 0, fexp
@@ -2842,7 +2866,7 @@ func (o *consumer) processWaiting() (int, int, int, time.Time) {
 	for i, rp, n := 0, wq.rp, wq.n; i < n; rp = (rp + 1) % cap(wq.reqs) {
 		wr := wq.reqs[rp]
 		// Check expiration.
-		if (wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
+		if (eos && wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
 			hdr := []byte("NATS/1.0 408 Request Timeout\r\n\r\n")
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 			remove(wr, rp)
@@ -2896,7 +2920,7 @@ func (o *consumer) processWaiting() (int, int, int, time.Time) {
 
 // Will check to make sure those waiting still have registered interest.
 func (o *consumer) checkWaitingForInterest() bool {
-	o.processWaiting()
+	o.processWaiting(true)
 	return o.waiting.len() > 0
 }
 
@@ -2906,6 +2930,30 @@ func (o *consumer) hbTimer() (time.Duration, *time.Timer) {
 		return 0, nil
 	}
 	return o.cfg.Heartbeat, time.NewTimer(o.cfg.Heartbeat)
+}
+
+func (o *consumer) processInboundAcks(qch chan struct{}) {
+	// Grab the server lock to watch for server quit.
+	o.mu.RLock()
+	s := o.srv
+	o.mu.RUnlock()
+
+	for {
+		select {
+		case <-o.ackMsgs.ch:
+			acks := o.ackMsgs.pop()
+			for _, acki := range acks {
+				ack := acki.(*jsAckMsg)
+				o.processAck(ack.subject, ack.reply, ack.hdr, ack.msg)
+				ack.returnToPool()
+			}
+			o.ackMsgs.recycle(&acks)
+		case <-qch:
+			return
+		case <-s.quitCh:
+			return
+		}
+	}
 }
 
 func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
@@ -2949,22 +2997,25 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	rp := mset.cfg.Retention
 	mset.mu.RUnlock()
 
+	var err error
+
 	// Deliver all the msgs we have now, once done or on a condition, we wait for new ones.
 	for {
 		var (
 			pmsg  *jsPubMsg
 			dc    uint64
 			dsubj string
-			err   error
 			delay time.Duration
 		)
-
 		o.mu.Lock()
 		// consumer is closed when mset is set to nil.
 		if o.mset == nil {
 			o.mu.Unlock()
 			return
 		}
+
+		// Clear last error.
+		err = nil
 
 		// If we are in push mode and not active or under flowcontrol let's stop sending.
 		if o.isPushMode() {
@@ -3059,7 +3110,8 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		// Make sure to process any expired requests that are pending.
 		var wrExp <-chan time.Time
 		if o.isPullMode() {
-			_, _, _, fexp := o.processWaiting()
+			// Dont expire oneshots if we are here because of max ack pending limit.
+			_, _, _, fexp := o.processWaiting(err != errMaxAckPending)
 			if !fexp.IsZero() {
 				expires := time.Until(fexp)
 				if expires <= 0 {
@@ -3074,25 +3126,17 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		o.mu.Unlock()
 
 		select {
-		case <-o.ackMsgs.ch:
-			acks := o.ackMsgs.pop()
-			for _, acki := range acks {
-				ack := acki.(*jsAckMsg)
-				o.processAck(ack.subject, ack.reply, ack.hdr, ack.msg)
-				ack.returnToPool()
-			}
-			o.ackMsgs.recycle(&acks)
+		case <-mch:
+			// Messages are waiting.
 		case interest := <-inch:
 			// inch can be nil on pull-based, but then this will
 			// just block and not fire.
 			o.updateDeliveryInterest(interest)
 		case <-qch:
 			return
-		case <-mch:
-			// Messages are waiting.
 		case <-wrExp:
 			o.mu.Lock()
-			o.processWaiting()
+			o.processWaiting(true)
 			o.mu.Unlock()
 		case <-hbc:
 			if o.isActive() {
@@ -3132,15 +3176,39 @@ func (o *consumer) setMaxPendingBytes(limit int) {
 	}
 }
 
-// We have the case where a consumer can become greedy and pick up a messages before the stream has incremented our pending(sgap).
-// Instead of trying to slow things down and synchronize we will allow this to wrap and go negative (biggest uint64) for a short time.
-// This functions checks for that and returns 0.
 // Lock should be held.
-func (o *consumer) adjustedPending() uint64 {
-	if o.sgap&(1<<63) != 0 {
+func (o *consumer) numPending() uint64 {
+	if o.npcm == 0 {
+		o.streamNumPending()
+	}
+	// This can wrap based on possibly having a dec before the inc. Account for that here.
+	if o.npc&(1<<63) != 0 {
 		return 0
 	}
-	return o.sgap
+	return o.npc
+}
+
+// Will force a set from the stream store of num pending.
+// Depends on delivery policy, for last per subject we calculate differently.
+// Lock should be held.
+func (o *consumer) streamNumPending() uint64 {
+	if o.mset == nil || o.mset.store == nil {
+		o.npc, o.npcm = 0, 0
+	} else if o.cfg.DeliverPolicy == DeliverLastPerSubject {
+		o.npc, o.npcm = 0, 0
+		for _, ss := range o.mset.store.SubjectsState(o.cfg.FilterSubject) {
+			if o.sseq <= ss.Last {
+				o.npc++
+				if ss.Last > o.npcm {
+					o.npcm = ss.Last
+				}
+			}
+		}
+	} else {
+		ss := o.mset.store.FilteredState(o.sseq, o.cfg.FilterSubject)
+		o.npc, o.npcm = ss.Msgs, ss.Last
+	}
+	return o.npc
 }
 
 // Deliver a msg to the consumer.
@@ -3151,10 +3219,9 @@ func (o *consumer) deliverMsg(dsubj string, pmsg *jsPubMsg, dc uint64, rp Retent
 		return
 	}
 
-	// Update pending on first attempt. This can go upside down for a short bit, that is ok.
-	// See adjustedPending().
-	if dc == 1 {
-		o.sgap--
+	// Update our cached num pending.
+	if dc == 1 && o.npcm > 0 {
+		o.npc--
 	}
 
 	dseq := o.dseq
@@ -3186,7 +3253,7 @@ func (o *consumer) deliverMsg(dsubj string, pmsg *jsPubMsg, dc uint64, rp Retent
 		pmsg.msg = nil
 	}
 
-	pmsg.dsubj, pmsg.reply, pmsg.o = dsubj, o.ackReply(pmsg.seq, dseq, dc, pmsg.ts, o.adjustedPending()), o
+	pmsg.dsubj, pmsg.reply, pmsg.o = dsubj, o.ackReply(pmsg.seq, dseq, dc, pmsg.ts, o.numPending()), o
 	psz := pmsg.size()
 
 	if o.maxpb > 0 {
@@ -3639,6 +3706,7 @@ func (o *consumer) selectStartingSeqNo() {
 				// TODO(dlc) - Once clustered can't rely on this.
 				o.sseq = o.mset.store.GetSeqFromTime(*o.cfg.OptStartTime)
 			} else {
+				// DeliverNew
 				o.sseq = state.LastSeq + 1
 			}
 		} else {
@@ -3660,6 +3728,11 @@ func (o *consumer) selectStartingSeqNo() {
 	o.adflr = o.dseq - 1
 	// Set ack store floor to store-1
 	o.asflr = o.sseq - 1
+
+	// Set our starting sequence state.
+	if o.store != nil && o.sseq > 0 {
+		o.store.SetStarting(o.sseq - 1)
+	}
 }
 
 // Test whether a config represents a durable subscriber.
@@ -3747,7 +3820,6 @@ func (o *consumer) purge(sseq uint64, slseq uint64) {
 			o.adflr = o.dseq - 1
 		}
 	}
-	o.sgap = 0
 	o.pending = nil
 
 	// We need to remove all those being queued for redelivery under o.rdq
@@ -3995,85 +4067,11 @@ func (o *consumer) requestNextMsgSubject() string {
 	return o.nextMsgSubj
 }
 
-// Will set the initial pending and start sequence.
-// mset lock should be held.
-func (o *consumer) setInitialPendingAndStart(hadState bool) {
-	mset := o.mset
-	if mset == nil || mset.store == nil {
-		return
-	}
-
-	// !filtered means we want all messages.
-	filtered, dp := o.cfg.FilterSubject != _EMPTY_, o.cfg.DeliverPolicy
-	if filtered {
-		// Check to see if we directly match the configured stream.
-		// Many clients will always send a filtered subject.
-		cfg := &mset.cfg
-		if len(cfg.Subjects) == 1 && cfg.Subjects[0] == o.cfg.FilterSubject {
-			filtered = false
-		}
-	}
-
-	if !filtered && (dp != DeliverLastPerSubject && dp != DeliverNew) {
-		var state StreamState
-		mset.store.FastState(&state)
-		if state.Msgs > 0 {
-			o.sgap = state.Msgs - (o.sseq - state.FirstSeq)
-			o.lsgap = state.LastSeq
-		}
-	} else {
-		// Here we are filtered.
-		if dp == DeliverLastPerSubject && o.hasSkipListPending() && o.sseq < o.lss.resume {
-			ss := mset.store.FilteredState(o.lss.resume+1, o.cfg.FilterSubject)
-			if !hadState {
-				o.sseq = o.lss.seqs[0]
-			}
-			o.sgap = ss.Msgs + uint64(len(o.lss.seqs))
-			o.lsgap = ss.Last
-		} else if ss := mset.store.FilteredState(o.sseq, o.cfg.FilterSubject); ss.Msgs > 0 {
-			o.sgap = ss.Msgs
-			o.lsgap = ss.Last
-			// See if we should update our starting sequence.
-			if dp == DeliverLast || dp == DeliverLastPerSubject {
-				if !hadState {
-					o.sseq = ss.Last
-				}
-			} else if dp == DeliverNew {
-				// If our original is larger we will ignore, we don't want to go backwards with DeliverNew.
-				// If its greater, we need to adjust pending.
-				if ss.Last >= o.sseq {
-					o.sgap -= (ss.Last - o.sseq + 1)
-					if !hadState {
-						o.sseq = ss.Last + 1
-					}
-				}
-			} else if !hadState {
-				// DeliverAll, DeliverByStartSequence, DeliverByStartTime
-				o.sseq = ss.First
-			}
-			// Cleanup lss when we take over in clustered mode.
-			if dp == DeliverLastPerSubject && o.hasSkipListPending() && o.sseq >= o.lss.resume {
-				o.lss = nil
-			}
-		}
-		o.updateSkipped()
-	}
-
-	// Update our persisted state if something has changed.
-	if store := o.store; store != nil {
-		if state, _ := store.State(); state != nil {
-			if o.dseq-1 > state.Delivered.Consumer || o.sseq-1 > state.Delivered.Stream {
-				o.writeStoreStateUnlocked()
-			}
-		}
-	}
-}
-
 func (o *consumer) decStreamPending(sseq uint64, subj string) {
 	o.mu.Lock()
-	// Ignore if we have already seen this one.
-	if sseq >= o.sseq && o.sgap > 0 && o.isFilteredMatch(subj) {
-		o.sgap--
+	// Update our cached num pending. Only do so if we think deliverMsg has not done so.
+	if sseq > o.npcm && sseq >= o.sseq && o.isFilteredMatch(subj) {
+		o.npc--
 	}
 	// Check if this message was pending.
 	p, wasPending := o.pending[sseq]

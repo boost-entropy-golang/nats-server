@@ -94,23 +94,24 @@ type JetStreamAPIStats struct {
 // This is for internal accounting for JetStream for this server.
 type jetStream struct {
 	// These are here first because of atomics on 32bit systems.
-	apiInflight   int64
-	apiTotal      int64
-	apiErrors     int64
-	memReserved   int64
-	storeReserved int64
-	memUsed       int64
-	storeUsed     int64
-	clustered     int32
-	mu            sync.RWMutex
-	srv           *Server
-	config        JetStreamConfig
-	cluster       *jetStreamCluster
-	accounts      map[string]*jsAccount
-	apiSubs       *Sublist
-	standAlone    bool
-	disabled      bool
-	oos           bool
+	apiInflight    int64
+	apiTotal       int64
+	apiErrors      int64
+	memReserved    int64
+	storeReserved  int64
+	memUsed        int64
+	storeUsed      int64
+	clustered      int32
+	mu             sync.RWMutex
+	srv            *Server
+	config         JetStreamConfig
+	cluster        *jetStreamCluster
+	accounts       map[string]*jsAccount
+	apiSubs        *Sublist
+	metaRecovering bool
+	standAlone     bool
+	disabled       bool
+	oos            bool
 }
 
 type remoteUsage struct {
@@ -635,17 +636,20 @@ func (s *Server) configJetStream(acc *Account) error {
 	if acc == nil {
 		return nil
 	}
-	if acc.jsLimits != nil {
+	acc.mu.RLock()
+	jsLimits := acc.jsLimits
+	acc.mu.RUnlock()
+	if jsLimits != nil {
 		// Check if already enabled. This can be during a reload.
 		if acc.JetStreamEnabled() {
 			if err := acc.enableAllJetStreamServiceImportsAndMappings(); err != nil {
 				return err
 			}
-			if err := acc.UpdateJetStreamLimits(acc.jsLimits); err != nil {
+			if err := acc.UpdateJetStreamLimits(jsLimits); err != nil {
 				return err
 			}
 		} else {
-			if err := acc.EnableJetStream(acc.jsLimits); err != nil {
+			if err := acc.EnableJetStream(jsLimits); err != nil {
 				return err
 			}
 			if s.gateway.enabled {
@@ -1269,7 +1273,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 			}
 			lseq := e.mset.lastSeq()
 			obs.mu.Lock()
-			_, err = obs.readStoredState(lseq)
+			err = obs.readStoredState(lseq)
 			obs.mu.Unlock()
 			if err != nil {
 				s.Warnf("    Error restoring consumer %q state: %v", cfg.Name, err)

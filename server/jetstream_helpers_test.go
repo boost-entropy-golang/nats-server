@@ -17,6 +17,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -28,6 +29,15 @@ import (
 )
 
 // Support functions
+
+func init() {
+	// Speed up raft for tests.
+	hbInterval = 50 * time.Millisecond
+	minElectionTimeout = 1 * time.Second
+	maxElectionTimeout = 3 * time.Second
+	lostQuorumInterval = time.Second
+	lostQuorumCheck = 4 * hbInterval
+}
 
 // Used to setup superclusters for tests.
 type supercluster struct {
@@ -424,7 +434,7 @@ func (sc *supercluster) leader() *Server {
 
 func (sc *supercluster) waitOnLeader() {
 	sc.t.Helper()
-	expires := time.Now().Add(5 * time.Second)
+	expires := time.Now().Add(10 * time.Second)
 	for time.Now().Before(expires) {
 		for _, c := range sc.clusters {
 			if leader := c.leader(); leader != nil {
@@ -1091,16 +1101,6 @@ func (c *cluster) randomNonStreamLeader(account, stream string) *Server {
 	return nil
 }
 
-func (c *cluster) randomStreamNotAssigned(account, stream string) *Server {
-	c.t.Helper()
-	for _, s := range c.servers {
-		if !s.JetStreamIsStreamAssigned(account, stream) {
-			return s
-		}
-	}
-	return nil
-}
-
 func (c *cluster) streamLeader(account, stream string) *Server {
 	c.t.Helper()
 	for _, s := range c.servers {
@@ -1190,7 +1190,7 @@ func (c *cluster) expectNoLeader() {
 		if c.leader() == nil {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	c.t.Fatalf("Expected no leader but have one")
 }
@@ -1326,4 +1326,22 @@ func (c *cluster) stableTotalSubs() (total int) {
 	})
 	return nsubs
 
+}
+
+func addStream(t *testing.T, nc *nats.Conn, cfg *StreamConfig) *StreamInfo {
+	t.Helper()
+	req, err := json.Marshal(cfg)
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamCreateResponse
+	err = json.Unmarshal(rmsg.Data, &resp)
+	require_NoError(t, err)
+	if resp.Type != JSApiStreamCreateResponseType {
+		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiStreamCreateResponseType)
+	}
+	if resp.Error != nil {
+		t.Fatalf("Unexpected error: %+v", resp.Error)
+	}
+	return resp.StreamInfo
 }

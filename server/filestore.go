@@ -93,7 +93,7 @@ type fileStore struct {
 	psmc    map[string]uint64
 	hh      hash.Hash64
 	qch     chan struct{}
-	cfs     []*consumerFileStore
+	cfs     []ConsumerStore
 	sips    int
 	closed  bool
 	fip     bool
@@ -1467,6 +1467,7 @@ func (fs *fileStore) FilteredState(sseq uint64, subj string) SimpleState {
 	wc := subjectHasWildcard(subj)
 	// Are we tracking multiple subject states?
 	if fs.tms {
+		fs.mu.RLock()
 		for _, mb := range fs.blks {
 			// Skip blocks that are less than our starting sequence.
 			if sseq > atomic.LoadUint64(&mb.last.seq) {
@@ -1481,6 +1482,7 @@ func (fs *fileStore) FilteredState(sseq uint64, subj string) SimpleState {
 				ss.Last = l
 			}
 		}
+		fs.mu.RUnlock()
 	} else {
 		// Fallback to linear scan.
 		var smv StoreMsg
@@ -3799,15 +3801,44 @@ func (fs *fileStore) LoadMsg(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
 	return fs.msgForSeq(seq, sm)
 }
 
+// loadLast will load the last message for a subject. Subject should be non empty and not ">".
+func (fs *fileStore) loadLast(subj string, sm *StoreMsg) (lsm *StoreMsg, err error) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	wc := subjectHasWildcard(subj)
+	// Walk blocks backwards.
+	for i := len(fs.blks) - 1; i >= 0; i-- {
+		mb := fs.blks[i]
+		if mb == nil {
+			continue
+		}
+		mb.mu.Lock()
+		_, _, l := mb.filteredPendingLocked(subj, wc, mb.first.seq)
+		if l > 0 {
+			if mb.cacheNotLoaded() {
+				if err := mb.loadMsgsWithLock(); err != nil {
+					mb.mu.Unlock()
+					return nil, err
+				}
+			}
+			lsm, err = mb.cacheLookup(l, sm)
+		}
+		mb.mu.Unlock()
+		if l > 0 {
+			break
+		}
+	}
+	return lsm, err
+}
+
 // LoadLastMsg will return the last message we have that matches a given subject.
 // The subject can be a wildcard.
 func (fs *fileStore) LoadLastMsg(subject string, sm *StoreMsg) (*StoreMsg, error) {
 	if subject == _EMPTY_ || subject == fwcs {
 		sm, _ = fs.msgForSeq(fs.lastSeq(), sm)
-	} else if ss := fs.FilteredState(1, subject); ss.Msgs > 0 {
-		sm, _ = fs.msgForSeq(ss.Last, sm)
 	} else {
-		sm = nil
+		sm, _ = fs.loadLast(subject, sm)
 	}
 	if sm == nil {
 		return nil, ErrStoreMsgNotFound
@@ -4993,7 +5024,7 @@ func (fs *fileStore) Stop() error {
 	fs.cancelSyncTimer()
 	fs.cancelAgeChk()
 
-	var _cfs [256]*consumerFileStore
+	var _cfs [256]ConsumerStore
 	cfs := append(_cfs[:0], fs.cfs...)
 	fs.cfs = nil
 	fs.mu.Unlock()
@@ -5147,7 +5178,11 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, state *StreamState, includ
 	cfs := fs.cfs
 	fs.mu.Unlock()
 
-	for _, o := range cfs {
+	for _, cs := range cfs {
+		o, ok := cs.(*consumerFileStore)
+		if !ok {
+			continue
+		}
 		o.mu.Lock()
 		// Grab our general meta data.
 		// We do this now instead of pulling from files since they could be encrypted.
@@ -5261,6 +5296,15 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 	if cfg == nil || name == _EMPTY_ {
 		return nil, fmt.Errorf("bad consumer config")
 	}
+
+	// We now allow overrides from a stream being a filestore type and forcing a consumer to be memory store.
+	if cfg.MemoryStorage {
+		// Create directly here.
+		o := &consumerMemStore{ms: fs, cfg: *cfg}
+		fs.AddConsumer(o)
+		return o, nil
+	}
+
 	odir := filepath.Join(fs.fcfg.StoreDir, consumerDir, name)
 	if err := os.MkdirAll(odir, defaultDirPerms); err != nil {
 		return nil, fmt.Errorf("could not create consumer directory - %v", err)
@@ -5337,9 +5381,7 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 	o.qch = make(chan struct{})
 	go o.flushLoop()
 
-	fs.mu.Lock()
-	fs.cfs = append(fs.cfs, o)
-	fs.mu.Unlock()
+	fs.AddConsumer(o)
 
 	return o, nil
 }
@@ -5433,6 +5475,26 @@ func (o *consumerFileStore) flushLoop() {
 			return
 		}
 	}
+}
+
+// SetStarting sets our starting stream sequence.
+func (o *consumerFileStore) SetStarting(sseq uint64) error {
+	o.mu.Lock()
+	o.state.Delivered.Stream = sseq
+	buf, err := o.encodeState()
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return o.writeState(buf)
+}
+
+// HasState returns if this store has a recorded state.
+func (o *consumerFileStore) HasState() bool {
+	o.mu.Lock()
+	_, err := os.Stat(o.ifn)
+	o.mu.Unlock()
+	return err == nil
 }
 
 // UpdateDelivered is called whenever a new message has been delivered.
@@ -6005,7 +6067,7 @@ func (o *consumerFileStore) Stop() error {
 	ifn, fs := o.ifn, o.fs
 	o.mu.Unlock()
 
-	fs.removeConsumer(o)
+	fs.RemoveConsumer(o)
 
 	if len(buf) > 0 {
 		o.waitOnFlusher()
@@ -6065,21 +6127,29 @@ func (o *consumerFileStore) delete(streamDeleted bool) error {
 	}
 
 	if !streamDeleted {
-		fs.removeConsumer(o)
+		fs.RemoveConsumer(o)
 	}
 
 	return err
 }
 
-func (fs *fileStore) removeConsumer(cfs *consumerFileStore) {
+func (fs *fileStore) AddConsumer(o ConsumerStore) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	for i, o := range fs.cfs {
+	fs.cfs = append(fs.cfs, o)
+	return nil
+}
+
+func (fs *fileStore) RemoveConsumer(o ConsumerStore) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for i, cfs := range fs.cfs {
 		if o == cfs {
 			fs.cfs = append(fs.cfs[:i], fs.cfs[i+1:]...)
 			break
 		}
 	}
+	return nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////
