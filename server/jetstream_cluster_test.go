@@ -10662,7 +10662,7 @@ func TestJetStreamClusterStreamRepublish(t *testing.T) {
 		Name:     "RP",
 		Storage:  MemoryStorage,
 		Subjects: []string{"foo", "bar", "baz"},
-		Replicas: 1,
+		Replicas: 3,
 		RePublish: &RePublish{
 			Source:      ">",
 			Destination: "RP.>",
@@ -10874,4 +10874,28 @@ func TestJetStreamClusterNoRestartAdvisories(t *testing.T) {
 	c.waitOnServerHealthz(s)
 
 	checkSubsPending(t, sub, 0)
+}
+
+func TestJetStreamClusterR1StreamPlacementNoReservation(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	sp := make(map[string]int)
+	for i := 0; i < 100; i++ {
+		sname := fmt.Sprintf("T-%d", i)
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name: sname,
+		})
+		require_NoError(t, err)
+		sp[c.streamLeader("$G", sname).Name()]++
+	}
+
+	for serverName, num := range sp {
+		if num > 60 {
+			t.Fatalf("Streams not distributed, expected ~30-35 but got %d for server %q", num, serverName)
+		}
+	}
 }

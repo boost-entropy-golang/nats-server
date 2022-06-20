@@ -72,6 +72,8 @@ type StreamConfig struct {
 	// AllowRollup allows messages to be placed into the system and purge
 	// all older messages using a special msg header.
 	AllowRollup bool `json:"allow_rollup_hdrs"`
+	// Allow higher peformance, direct access to get individual messages.
+	AllowDirect bool `json:"allow_direct,omitempty"`
 }
 
 // RePublish is for republishing messages once committed to a stream.
@@ -265,10 +267,12 @@ const (
 	JSResponseType        = "Nats-Response-Type"
 )
 
-// Headers for republished messages.
+// Headers for republished messages and direct gets.
 const (
 	JSStream       = "Nats-Stream"
 	JSSequence     = "Nats-Sequence"
+	JSTimeStamp    = "Nats-Time-Stamp"
+	JSSubject      = "Nats-Subject"
 	JSLastSequence = "Nats-Last-Sequence"
 )
 
@@ -456,7 +460,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 
 	if err := mset.setupStore(fsCfg); err != nil {
 		mset.stop(true, false)
-		return nil, err
+		return nil, NewJSStreamStoreFailedError(err)
 	}
 
 	// Create our pubAck template here. Better than json marshal each time on success.
@@ -2844,6 +2848,12 @@ func (mset *stream) subscribeToStream() error {
 			return err
 		}
 	}
+	if mset.cfg.AllowDirect {
+		dsubj := fmt.Sprintf(JSDirectMsgGetT, mset.cfg.Name)
+		if _, err := mset.subscribeInternal(dsubj, mset.processDirectGetRequest); err != nil {
+			return err
+		}
+	}
 
 	mset.active = true
 	return nil
@@ -2879,6 +2889,9 @@ func (mset *stream) unsubscribeToStream() error {
 	if len(mset.cfg.Sources) > 0 {
 		mset.stopSourceConsumers()
 	}
+
+	// In case we had a direct get subscription.
+	mset.unsubscribeInternal(fmt.Sprintf(JSDirectMsgGetT, mset.cfg.Name))
 
 	mset.active = false
 	return nil
@@ -3161,6 +3174,71 @@ func (mset *stream) queueInboundMsg(subj, rply string, hdr, msg []byte) {
 		msg = copyBytes(msg)
 	}
 	mset.queueInbound(mset.msgs, subj, rply, hdr, msg)
+}
+
+// processDirectGetRequest handles direct get request for stream messages.
+func (mset *stream) processDirectGetRequest(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	_, msg := c.msgParts(rmsg)
+	if len(reply) == 0 {
+		return
+	}
+	if len(msg) == 0 {
+		hdr := []byte("NATS/1.0 408 Empty Request\r\n\r\n")
+		mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		return
+	}
+	var req JSApiMsgGetRequest
+	err := json.Unmarshal(msg, &req)
+	if err != nil {
+		hdr := []byte("NATS/1.0 408 Malformed Request\r\n\r\n")
+		mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		return
+	}
+	// Check if nothing set.
+	if req.Seq == 0 && req.LastFor == _EMPTY_ {
+		hdr := []byte("NATS/1.0 408 Empty Request\r\n\r\n")
+		mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		return
+	}
+	// Check that we do not have both options set.
+	if req.Seq > 0 && req.LastFor != _EMPTY_ {
+		hdr := []byte("NATS/1.0 408 Bad Request\r\n\r\n")
+		mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		return
+	}
+
+	var svp StoreMsg
+	var sm *StoreMsg
+
+	mset.mu.RLock()
+	store, name := mset.store, mset.cfg.Name
+	mset.mu.RUnlock()
+
+	if req.Seq > 0 {
+		sm, err = store.LoadMsg(req.Seq, &svp)
+	} else {
+		sm, err = store.LoadLastMsg(req.LastFor, &svp)
+	}
+	if err != nil {
+		hdr := []byte("NATS/1.0 404 Message Not Found\r\n\r\n")
+		mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		return
+	}
+
+	hdr := sm.hdr
+	ts := time.Unix(0, sm.ts).UTC()
+
+	if len(hdr) == 0 {
+		const ht = "NATS/1.0\r\nNats-Stream: %s\r\nNats-Subject: %s\r\nNats-Sequence: %d\r\nNats-Time-Stamp: %v\r\n\r\n"
+		hdr = []byte(fmt.Sprintf(ht, name, sm.subj, sm.seq, ts))
+	} else {
+		hdr = copyBytes(hdr)
+		hdr = genHeader(hdr, JSStream, name)
+		hdr = genHeader(hdr, JSSubject, sm.subj)
+		hdr = genHeader(hdr, JSSequence, strconv.FormatUint(sm.seq, 10))
+		hdr = genHeader(hdr, JSTimeStamp, ts.String())
+	}
+	mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, sm.msg, nil, 0))
 }
 
 // processInboundJetStreamMsg handles processing messages bound for a stream.
@@ -3486,12 +3564,12 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	var tlseq uint64
 	var thdrsOnly bool
 	if mset.tr != nil {
-		tsubj, _ = mset.tr.TransformSubject(subject)
+		tsubj, _ = mset.tr.transformSubject(subject)
 		if mset.cfg.RePublish != nil {
 			thdrsOnly = mset.cfg.RePublish.HeadersOnly
 		}
 	}
-	republish := tsubj != _EMPTY_
+	republish := tsubj != _EMPTY_ && isLeader
 
 	// We hold the lock to this point to make sure nothing gets between us since we check for pre-conditions.
 	// Currently can not hold while calling store b/c we have inline storage update calls that may need the lock.
@@ -3577,17 +3655,18 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		if republish {
 			var rpMsg []byte
 			if len(hdr) == 0 {
-				const ht = "NATS/1.0\r\nNats-Stream: %s\r\nNats-Sequence: %d\r\nNats-Last-Sequence: %d\r\n\r\n"
-				const htho = "NATS/1.0\r\nNats-Stream: %s\r\nNats-Sequence: %d\r\nNats-Last-Sequence: %d\r\nNats-Msg-Size: %d\r\n\r\n"
+				const ht = "NATS/1.0\r\nNats-Stream: %s\r\nNats-Subject: %s\r\nNats-Sequence: %d\r\nNats-Last-Sequence: %d\r\n\r\n"
+				const htho = "NATS/1.0\r\nNats-Stream: %s\r\nNats-Subject: %s\r\nNats-Sequence: %d\r\nNats-Last-Sequence: %d\r\nNats-Msg-Size: %d\r\n\r\n"
 				if !thdrsOnly {
-					hdr = []byte(fmt.Sprintf(ht, name, seq, tlseq))
+					hdr = []byte(fmt.Sprintf(ht, name, subject, seq, tlseq))
 					rpMsg = copyBytes(msg)
 				} else {
-					hdr = []byte(fmt.Sprintf(htho, name, seq, tlseq, len(msg)))
+					hdr = []byte(fmt.Sprintf(htho, name, subject, seq, tlseq, len(msg)))
 				}
 			} else {
 				// Slow path.
 				hdr = genHeader(hdr, JSStream, name)
+				hdr = genHeader(hdr, JSSubject, subject)
 				hdr = genHeader(hdr, JSSequence, strconv.FormatUint(seq, 10))
 				hdr = genHeader(hdr, JSLastSequence, strconv.FormatUint(tlseq, 10))
 				if !thdrsOnly {
@@ -3596,7 +3675,7 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 					hdr = genHeader(hdr, JSMsgSize, strconv.Itoa(len(msg)))
 				}
 			}
-			mset.outq.send(newJSPubMsg(tsubj, subject, _EMPTY_, copyBytes(hdr), rpMsg, nil, seq))
+			mset.outq.send(newJSPubMsg(tsubj, _EMPTY_, _EMPTY_, copyBytes(hdr), rpMsg, nil, seq))
 		}
 	}
 
@@ -4063,8 +4142,8 @@ func (mset *stream) removeConsumer(o *consumer) {
 
 // lookupConsumer will retrieve a consumer by name.
 func (mset *stream) lookupConsumer(name string) *consumer {
-	mset.mu.Lock()
-	defer mset.mu.Unlock()
+	mset.mu.RLock()
+	defer mset.mu.RUnlock()
 	return mset.consumers[name]
 }
 

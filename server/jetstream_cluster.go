@@ -2753,7 +2753,10 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 
 	// This is an error condition.
 	if err != nil {
-		s.Warnf("Stream create failed for '%s > %s': %v", sa.Client.serviceAccount(), sa.Config.Name, err)
+		if IsNatsErr(err, JSStreamStoreFailedF) {
+			s.Warnf("Stream create failed for '%s > %s': %v", sa.Client.serviceAccount(), sa.Config.Name, err)
+			err = errStreamStoreFailed
+		}
 		js.mu.Lock()
 
 		sa.err = err
@@ -2943,7 +2946,10 @@ func (js *jetStream) processClusterDeleteStream(sa *streamAssignment, isMember, 
 		sa.Group.node.Delete()
 	}
 
-	if !isMember || !wasLeader && hadLeader {
+	// Normally we want only the leader to respond here, but if we had no leader then all members will respond to make
+	// sure we get feedback to the user.
+	if !isMember || (hadLeader && !wasLeader) {
+		// If all the peers are offline and we are the meta leader we will also respond, so suppress returning here.
 		if !(offline && isMetaLeader) {
 			return
 		}
@@ -3245,6 +3251,7 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment, state 
 	if err != nil {
 		if IsNatsErr(err, JSConsumerStoreFailedErrF) {
 			s.Warnf("Consumer create failed for '%s > %s > %s': %v", ca.Client.serviceAccount(), ca.Stream, ca.Name, err)
+			err = errConsumerStoreFailed
 		}
 
 		js.mu.Lock()
@@ -4151,6 +4158,7 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 	type wn struct {
 		id    string
 		avail uint64
+		ha    int
 	}
 
 	var nodes []wn
@@ -4173,7 +4181,7 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 	if uniqueTagPrefix != _EMPTY_ {
 		for _, tag := range tags {
 			if strings.HasPrefix(tag, uniqueTagPrefix) {
-				// disable uniqueness check of explicitly listed in tags
+				// disable uniqueness check if explicitly listed in tags
 				uniqueTagPrefix = _EMPTY_
 				break
 			}
@@ -4182,6 +4190,8 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 	var uniqueTags = make(map[string]struct{})
 	maxHaAssets := s.getOpts().JetStreamLimits.MaxHAAssets
 
+	// Shuffle them up.
+	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
 	for _, p := range peers {
 		si, ok := s.nodeToInfo.Load(p.ID)
 		if !ok || si == nil {
@@ -4215,23 +4225,27 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 		}
 
 		var available uint64
-		switch cfg.Storage {
-		case MemoryStorage:
-			used := ni.stats.ReservedMemory
-			if ni.stats.Memory > used {
-				used = ni.stats.Memory
+		var ha int
+		if ni.stats != nil {
+			switch cfg.Storage {
+			case MemoryStorage:
+				used := ni.stats.ReservedMemory
+				if ni.stats.Memory > used {
+					used = ni.stats.Memory
+				}
+				if ni.cfg.MaxMemory > int64(used) {
+					available = uint64(ni.cfg.MaxMemory) - used
+				}
+			case FileStorage:
+				used := ni.stats.ReservedStore
+				if ni.stats.Store > used {
+					used = ni.stats.Store
+				}
+				if ni.cfg.MaxStore > int64(used) {
+					available = uint64(ni.cfg.MaxStore) - used
+				}
 			}
-			if ni.cfg.MaxMemory > int64(used) {
-				available = uint64(ni.cfg.MaxMemory) - used
-			}
-		case FileStorage:
-			used := ni.stats.ReservedStore
-			if ni.stats.Store > used {
-				used = ni.stats.Store
-			}
-			if ni.cfg.MaxStore > int64(used) {
-				available = uint64(ni.cfg.MaxStore) - used
-			}
+			ha = ni.stats.HAAssets
 		}
 
 		// Otherwise check if we have enough room if maxBytes set.
@@ -4264,7 +4278,7 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 			}
 		}
 		// Add to our list of potential nodes.
-		nodes = append(nodes, wn{p.ID, available})
+		nodes = append(nodes, wn{p.ID, available, ha})
 	}
 
 	// If we could not select enough peers, fail.
@@ -4273,6 +4287,11 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 	}
 	// Sort based on available from most to least.
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].avail > nodes[j].avail })
+
+	// If we are placing a replicated stream, let's sort based in haAssets, as that is more important to balance.
+	if cfg.Replicas > 1 {
+		sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].ha < nodes[j].ha })
+	}
 
 	var results []string
 	if len(existing) > 0 {
@@ -4748,11 +4767,6 @@ func (s *Server) jsClusteredStreamDeleteRequest(ci *ClientInfo, acc *Account, st
 		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
-	}
-	// Remove any remaining consumers as well.
-	for _, ca := range osa.consumers {
-		ca.Reply, ca.State = _EMPTY_, nil
-		cc.meta.Propose(encodeDeleteConsumerAssignment(ca))
 	}
 
 	sa := &streamAssignment{Group: osa.Group, Config: osa.Config, Subject: subject, Reply: reply, Client: ci}

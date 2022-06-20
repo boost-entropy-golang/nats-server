@@ -118,6 +118,12 @@ const (
 	JSApiMsgGet  = "$JS.API.STREAM.MSG.GET.*"
 	JSApiMsgGetT = "$JS.API.STREAM.MSG.GET.%s"
 
+	// JSDirectMsgGet is the template for non-api layer direct requests for a message by its stream sequence number or last by subject.
+	// Will return the message similar to how a consumer receives the message, no JSON processing.
+	// If the message can not be found we will use a status header of 404. If the stream does not exist the client will get a no-responders or timeout.
+	JSDirectMsgGet  = "$JS.DS.GET.*"
+	JSDirectMsgGetT = "$JS.DS.GET.%s"
+
 	// JSApiConsumerCreate is the endpoint to create ephemeral consumers for streams.
 	// Will return JSON response.
 	JSApiConsumerCreate  = "$JS.API.CONSUMER.CREATE.*"
@@ -303,6 +309,12 @@ type ApiResponse struct {
 	Type  string    `json:"type"`
 	Error *ApiError `json:"error,omitempty"`
 }
+
+// When passing back to the clients generalize store failures.
+var (
+	errStreamStoreFailed   = errors.New("error creating store for stream")
+	errConsumerStoreFailed = errors.New("error creating store for consumer")
+)
 
 // ToError checks if the response has a error and if it does converts it to an error avoiding
 // the pitfalls described by https://yourbasic.org/golang/gotcha-why-nil-error-not-equal-nil/
@@ -1260,6 +1272,10 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, _ *Account,
 
 	mset, err := acc.addStream(&cfg)
 	if err != nil {
+		if IsNatsErr(err, JSStreamStoreFailedF) {
+			s.Warnf("Stream create failed for '%s > %s': %v", acc, streamName, err)
+			err = errStreamStoreFailed
+		}
 		resp.Error = NewJSStreamCreateError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
@@ -3280,7 +3296,13 @@ func (s *Server) jsConsumerCreate(sub *subscription, c *client, a *Account, subj
 	}
 
 	o, err := stream.addConsumer(&req.Config)
+
 	if err != nil {
+		if IsNatsErr(err, JSConsumerStoreFailedErrF) {
+			cname := req.Config.Durable // Will be empty if ephemeral.
+			s.Warnf("Consumer create failed for '%s > %s > %s': %v", acc, req.Stream, cname, err)
+			err = errConsumerStoreFailed
+		}
 		resp.Error = NewJSConsumerCreateError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return

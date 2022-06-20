@@ -5372,7 +5372,6 @@ func TestJetStreamConsumerInactiveNoDeadlock(t *testing.T) {
 			// the internal sendq.
 			sub.Unsubscribe()
 			nc.Flush()
-
 		})
 	}
 }
@@ -17429,7 +17428,7 @@ func TestJetStreamPullMaxBytes(t *testing.T) {
 	}
 
 	// If we ask for less MaxBytes then a single message make sure we get an error.
-	badReq := &nats.Header{"Status": []string{"408"}, "Description": []string{"Message Size Exceeds MaxBytes"}}
+	badReq := &nats.Header{"Status": []string{"409"}, "Description": []string{"Message Size Exceeds MaxBytes"}}
 
 	nc.PublishRequest(subj, reply, jreq)
 	m, err := sub.NextMsg(time.Second)
@@ -17746,6 +17745,172 @@ func TestJetStreamMsgGetNoAdvisory(t *testing.T) {
 	checkSubsPending(t, sub, 0)
 }
 
+func TestJetStreamDirectMsgGet(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Do by hand for now.
+	cfg := &StreamConfig{
+		Name:        "DSMG",
+		Storage:     MemoryStorage,
+		Subjects:    []string{"foo", "bar", "baz"},
+		MaxMsgsPer:  1,
+		AllowDirect: true,
+	}
+	addStream(t, nc, cfg)
+
+	sendStreamMsg(t, nc, "foo", "foo")
+	sendStreamMsg(t, nc, "bar", "bar")
+	sendStreamMsg(t, nc, "baz", "baz")
+
+	getSubj := fmt.Sprintf(JSDirectMsgGetT, "DSMG")
+	getMsg := func(req *JSApiMsgGetRequest) *nats.Msg {
+		var b []byte
+		var err error
+		if req != nil {
+			b, err = json.Marshal(req)
+			require_NoError(t, err)
+		}
+		m, err := nc.Request(getSubj, b, time.Second)
+		require_NoError(t, err)
+		return m
+	}
+
+	m := getMsg(&JSApiMsgGetRequest{LastFor: "foo"})
+	require_True(t, string(m.Data) == "foo")
+	require_True(t, m.Header.Get(JSStream) == "DSMG")
+	require_True(t, m.Header.Get(JSSequence) == "1")
+	require_True(t, m.Header.Get(JSSubject) == "foo")
+	require_True(t, m.Subject != "foo")
+	require_True(t, m.Header.Get(JSTimeStamp) != _EMPTY_)
+
+	m = getMsg(&JSApiMsgGetRequest{LastFor: "bar"})
+	require_True(t, string(m.Data) == "bar")
+	require_True(t, m.Header.Get(JSStream) == "DSMG")
+	require_True(t, m.Header.Get(JSSequence) == "2")
+	require_True(t, m.Header.Get(JSSubject) == "bar")
+	require_True(t, m.Subject != "bar")
+	require_True(t, m.Header.Get(JSTimeStamp) != _EMPTY_)
+
+	m = getMsg(&JSApiMsgGetRequest{LastFor: "baz"})
+	require_True(t, string(m.Data) == "baz")
+	require_True(t, m.Header.Get(JSStream) == "DSMG")
+	require_True(t, m.Header.Get(JSSequence) == "3")
+	require_True(t, m.Header.Get(JSSubject) == "baz")
+	require_True(t, m.Subject != "baz")
+	require_True(t, m.Header.Get(JSTimeStamp) != _EMPTY_)
+
+	// Test error conditions
+
+	// Nil request
+	m = getMsg(nil)
+	require_True(t, len(m.Data) == 0)
+	require_True(t, m.Header.Get("Status") == "408")
+	require_True(t, m.Header.Get("Description") == "Empty Request")
+
+	// Empty request
+	m = getMsg(&JSApiMsgGetRequest{})
+	require_True(t, len(m.Data) == 0)
+	require_True(t, m.Header.Get("Status") == "408")
+	require_True(t, m.Header.Get("Description") == "Empty Request")
+
+	// Both set
+	m = getMsg(&JSApiMsgGetRequest{Seq: 1, LastFor: "foo"})
+	require_True(t, len(m.Data) == 0)
+	require_True(t, m.Header.Get("Status") == "408")
+	require_True(t, m.Header.Get("Description") == "Bad Request")
+
+	// Not found
+	m = getMsg(&JSApiMsgGetRequest{LastFor: "foobar"})
+	require_True(t, len(m.Data) == 0)
+	require_True(t, m.Header.Get("Status") == "404")
+	require_True(t, m.Header.Get("Description") == "Message Not Found")
+
+	m = getMsg(&JSApiMsgGetRequest{Seq: 22})
+	require_True(t, len(m.Data) == 0)
+	require_True(t, m.Header.Get("Status") == "404")
+	require_True(t, m.Header.Get("Description") == "Message Not Found")
+}
+
+func TestJetStreamConsumerInactiveThreshold(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		js.PublishAsync("foo", []byte("ok"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	waitOnCleanup := func(ci *nats.ConsumerInfo) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			_, err := js.ConsumerInfo(ci.Stream, ci.Name)
+			if err == nil {
+				return fmt.Errorf("Consumer still present")
+			}
+			return nil
+		})
+	}
+
+	// Test to make sure inactive threshold is enforced for all types.
+	// Ephemeral and Durable, both push and pull.
+
+	// Ephemeral Push (no bind to deliver subject)
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+		DeliverSubject:    "_no_bind_",
+		InactiveThreshold: 50 * time.Millisecond,
+	})
+	require_NoError(t, err)
+	waitOnCleanup(ci)
+
+	// Ephemeral Pull
+	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: 50 * time.Millisecond,
+	})
+	require_NoError(t, err)
+	waitOnCleanup(ci)
+
+	// Support InactiveThresholds for Durables as well.
+
+	// Durable Push (no bind to deliver subject)
+	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "d1",
+		DeliverSubject:    "_no_bind_",
+		InactiveThreshold: 50 * time.Millisecond,
+	})
+	require_NoError(t, err)
+	waitOnCleanup(ci)
+
+	// Durable Pull
+	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "d2",
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: 50 * time.Millisecond,
+	})
+	require_NoError(t, err)
+	waitOnCleanup(ci)
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Simple JetStream Benchmarks
 ///////////////////////////////////////////////////////////////////////////
@@ -18047,10 +18212,59 @@ func TestJetStreamKVMemoryStorePerf(t *testing.T) {
 
 	start = time.Now()
 	for i := 0; i < 100_000; i++ {
-		_, err := kv.PutString(fmt.Sprintf("foo.%d", i), "HELLO")
+		_, err := kv.PutString(fmt.Sprintf("foo.%d", i), "HELLO WORLD")
 		require_NoError(t, err)
 	}
 	fmt.Printf("Took %v for second run\n", time.Since(start))
+
+	start = time.Now()
+	for i := 0; i < 100_000; i++ {
+		_, err := kv.Get(fmt.Sprintf("foo.%d", i))
+		require_NoError(t, err)
+	}
+	fmt.Printf("Took %v for get\n", time.Since(start))
+}
+
+func TestJetStreamKVMemoryStoreDirectGetPerf(t *testing.T) {
+	// Comment out to run, holding place for now.
+	t.SkipNow()
+
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := &StreamConfig{
+		Name:        "TEST",
+		Storage:     MemoryStorage,
+		Subjects:    []string{"foo.*"},
+		MaxMsgsPer:  1,
+		AllowDirect: true,
+	}
+	addStream(t, nc, cfg)
+
+	start := time.Now()
+	for i := 0; i < 100_000; i++ {
+		_, err := js.Publish(fmt.Sprintf("foo.%d", i), []byte("HELLO"))
+		require_NoError(t, err)
+	}
+	fmt.Printf("Took %v for put\n", time.Since(start))
+
+	getSubj := fmt.Sprintf(JSDirectMsgGetT, "TEST")
+
+	const tmpl = "{\"last_by_subj\":%q}"
+
+	start = time.Now()
+	for i := 0; i < 100_000; i++ {
+		req := []byte(fmt.Sprintf(tmpl, fmt.Sprintf("foo.%d", i)))
+		_, err := nc.Request(getSubj, req, time.Second)
+		require_NoError(t, err)
+	}
+	fmt.Printf("Took %v for get\n", time.Since(start))
 }
 
 func TestJetStreamMultiplePullPerf(t *testing.T) {
