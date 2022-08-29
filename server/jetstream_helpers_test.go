@@ -17,15 +17,19 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"net"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"golang.org/x/time/rate"
 )
 
 // Support functions
@@ -43,6 +47,7 @@ func init() {
 type supercluster struct {
 	t        *testing.T
 	clusters []*cluster
+	nproxies []*netProxy
 }
 
 func (sc *supercluster) shutdown() {
@@ -51,6 +56,9 @@ func (sc *supercluster) shutdown() {
 	}
 	for _, c := range sc.clusters {
 		shutdownCluster(c)
+	}
+	for _, np := range sc.nproxies {
+		np.stop()
 	}
 }
 
@@ -112,6 +120,25 @@ var jsClusterTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
 	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+	leaf {
+		listen: 127.0.0.1:-1
+	}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+
+	# For access to system account.
+	accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+`
+
+var jsClusterEncryptedTempl = `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s', key: "s3cr3t!"}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -238,7 +265,11 @@ var jsMixedModeGlobalAccountTempl = `
 var jsGWTempl = `%s{name: %s, urls: [%s]}`
 
 func createJetStreamTaggedSuperCluster(t *testing.T) *supercluster {
-	sc := createJetStreamSuperCluster(t, 3, 3)
+	return createJetStreamTaggedSuperClusterWithGWProxy(t, nil)
+}
+
+func createJetStreamTaggedSuperClusterWithGWProxy(t *testing.T, gwm gwProxyMap) *supercluster {
+	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterTempl, 3, 3, nil, gwm)
 	sc.waitOnPeerCount(9)
 
 	reset := func(s *Server) {
@@ -310,10 +341,20 @@ func createJetStreamSuperCluster(t *testing.T, numServersPer, numClusters int) *
 }
 
 func createJetStreamSuperClusterWithTemplate(t *testing.T, tmpl string, numServersPer, numClusters int) *supercluster {
-	return createJetStreamSuperClusterWithTemplateAndModHook(t, tmpl, numServersPer, numClusters, nil)
+	return createJetStreamSuperClusterWithTemplateAndModHook(t, tmpl, numServersPer, numClusters, nil, nil)
 }
 
-func createJetStreamSuperClusterWithTemplateAndModHook(t *testing.T, tmpl string, numServersPer, numClusters int, modify modifyCb) *supercluster {
+// For doing proxyies in GWs.
+type gwProxy struct {
+	rtt  time.Duration
+	up   int
+	down int
+}
+
+// Maps cluster names to proxy settings.
+type gwProxyMap map[string]*gwProxy
+
+func createJetStreamSuperClusterWithTemplateAndModHook(t *testing.T, tmpl string, numServersPer, numClusters int, modify modifyCb, gwm gwProxyMap) *supercluster {
 	t.Helper()
 	if numServersPer < 1 {
 		t.Fatalf("Number of servers must be >= 1")
@@ -333,19 +374,30 @@ func createJetStreamSuperClusterWithTemplateAndModHook(t *testing.T, tmpl string
 
 	cp, gp := startClusterPort, startGWPort
 	var clusters []*cluster
-
+	var nproxies []*netProxy
 	var gws []string
+
 	// Build GWs first, will be same for all servers.
 	for i, port := 1, gp; i <= numClusters; i++ {
 		cn := fmt.Sprintf("C%d", i)
+		var gwp *gwProxy
+		if len(gwm) > 0 {
+			gwp = gwm[cn]
+		}
 		var urls []string
 		for n := 0; n < numServersPer; n++ {
-			urls = append(urls, fmt.Sprintf("nats-route://127.0.0.1:%d", port))
+			routeURL := fmt.Sprintf("nats-route://127.0.0.1:%d", port)
+			if gwp != nil {
+				np := createNetProxy(gwp.rtt, gwp.up, gwp.down, routeURL, false)
+				nproxies = append(nproxies, np)
+				routeURL = np.routeURL()
+			}
+			urls = append(urls, routeURL)
 			port++
 		}
 		gws = append(gws, fmt.Sprintf(jsGWTempl, "\n\t\t\t", cn, strings.Join(urls, ",")))
 	}
-	gwconf := strings.Join(gws, "")
+	gwconf := strings.Join(gws, _EMPTY_)
 
 	for i := 1; i <= numClusters; i++ {
 		cn := fmt.Sprintf("C%d", i)
@@ -378,15 +430,20 @@ func createJetStreamSuperClusterWithTemplateAndModHook(t *testing.T, tmpl string
 		c.t = t
 	}
 
+	// Start any proxies.
+	for _, np := range nproxies {
+		np.start()
+	}
+
 	// Wait for the supercluster to be formed.
 	egws := numClusters - 1
 	for _, c := range clusters {
 		for _, s := range c.servers {
-			waitForOutboundGateways(t, s, egws, 2*time.Second)
+			waitForOutboundGateways(t, s, egws, 10*time.Second)
 		}
 	}
 
-	sc := &supercluster{t, clusters}
+	sc := &supercluster{t, clusters, nproxies}
 	sc.waitOnLeader()
 	sc.waitOnAllCurrent()
 
@@ -410,16 +467,22 @@ func createJetStreamSuperClusterWithTemplateAndModHook(t *testing.T, tmpl string
 }
 
 func (sc *supercluster) createLeafNodes(clusterName string, numServers int) *cluster {
+	sc.t.Helper()
+
 	// Create our leafnode cluster template first.
 	return sc.createLeafNodesWithDomain(clusterName, numServers, "")
 }
 
 func (sc *supercluster) createLeafNodesWithDomain(clusterName string, numServers int, domain string) *cluster {
+	sc.t.Helper()
+
 	// Create our leafnode cluster template first.
 	return sc.randomCluster().createLeafNodes(clusterName, numServers, domain)
 }
 
 func (sc *supercluster) createSingleLeafNode(extend bool) *Server {
+	sc.t.Helper()
+
 	return sc.randomCluster().createLeafNode(extend)
 }
 
@@ -684,7 +747,7 @@ func createJetStreamClusterAndModHook(t *testing.T, tmpl string, clusterName, sn
 func (c *cluster) addInNewServer() *Server {
 	c.t.Helper()
 	sn := fmt.Sprintf("S-%d", len(c.servers)+1)
-	storeDir, _ := ioutil.TempDir(tempRoot, JetStreamStoreDir)
+	storeDir, _ := os.MkdirTemp(tempRoot, JetStreamStoreDir)
 	seedRoute := fmt.Sprintf("nats-route://127.0.0.1:%d", c.opts[0].Cluster.Port)
 	conf := fmt.Sprintf(jsClusterTempl, sn, storeDir, c.name, -1, seedRoute)
 	s, o := RunServerWithConfig(createConfFile(c.t, []byte(conf)))
@@ -828,14 +891,17 @@ var jsLeafFrag = `
 `
 
 func (c *cluster) createLeafNodes(clusterName string, numServers int, domain string) *cluster {
+	c.t.Helper()
 	return c.createLeafNodesWithStartPortAndDomain(clusterName, numServers, 22111, domain)
 }
 
 func (c *cluster) createLeafNodesNoJS(clusterName string, numServers int) *cluster {
+	c.t.Helper()
 	return c.createLeafNodesWithTemplateAndStartPort(jsClusterTemplWithLeafNodeNoJS, clusterName, numServers, 21333)
 }
 
 func (c *cluster) createLeafNodesWithStartPortAndDomain(clusterName string, numServers int, portStart int, domain string) *cluster {
+	c.t.Helper()
 	if domain == _EMPTY_ {
 		return c.createLeafNodesWithTemplateAndStartPort(jsClusterTemplWithLeafNode, clusterName, numServers, portStart)
 	}
@@ -844,6 +910,7 @@ func (c *cluster) createLeafNodesWithStartPortAndDomain(clusterName string, numS
 }
 
 func (c *cluster) createLeafNode(extend bool) *Server {
+	c.t.Helper()
 	if extend {
 		return c.createLeafNodeWithTemplate("LNS",
 			strings.ReplaceAll(jsClusterTemplWithSingleLeafNode, "store_dir:", " extension_hint: will_extend, store_dir:"))
@@ -853,6 +920,7 @@ func (c *cluster) createLeafNode(extend bool) *Server {
 }
 
 func (c *cluster) createLeafNodeWithTemplate(name, template string) *Server {
+	c.t.Helper()
 	tmpl := c.createLeafSolicit(template)
 	conf := fmt.Sprintf(tmpl, name, createDir(c.t, JetStreamStoreDir))
 	s, o := RunServerWithConfig(createConfFile(c.t, []byte(conf)))
@@ -863,6 +931,8 @@ func (c *cluster) createLeafNodeWithTemplate(name, template string) *Server {
 
 // Helper to generate the leaf solicit configs.
 func (c *cluster) createLeafSolicit(tmpl string) string {
+	c.t.Helper()
+
 	// Create our leafnode cluster template first.
 	var lns, lnss []string
 	for _, s := range c.servers {
@@ -880,6 +950,8 @@ func (c *cluster) createLeafSolicit(tmpl string) string {
 }
 
 func (c *cluster) createLeafNodesWithTemplateMixedMode(template, clusterName string, numJsServers, numNonServers int, doJSConfig bool) *cluster {
+	c.t.Helper()
+
 	// Create our leafnode cluster template first.
 	tmpl := c.createLeafSolicit(template)
 	pre := clusterName + "-"
@@ -894,6 +966,8 @@ func (c *cluster) createLeafNodesWithTemplateMixedMode(template, clusterName str
 }
 
 func (c *cluster) createLeafNodesWithTemplateAndStartPort(template, clusterName string, numServers int, portStart int) *cluster {
+	c.t.Helper()
+
 	// Create our leafnode cluster template first.
 	tmpl := c.createLeafSolicit(template)
 	pre := clusterName + "-"
@@ -904,8 +978,35 @@ func (c *cluster) createLeafNodesWithTemplateAndStartPort(template, clusterName 
 	return lc
 }
 
+// Helper function to close and disable leafnodes.
+func (s *Server) closeAndDisableLeafnodes() {
+	var leafs []*client
+	s.mu.Lock()
+	for _, ln := range s.leafs {
+		leafs = append(leafs, ln)
+	}
+	// Disable leafnodes for now.
+	s.leafDisableConnect = true
+	s.mu.Unlock()
+
+	for _, ln := range leafs {
+		ln.closeConnection(Revocation)
+	}
+}
+
+// Helper to set the remote migrate feature.
+func (s *Server) setJetStreamMigrateOnRemoteLeaf() {
+	s.mu.Lock()
+	for _, cfg := range s.leafRemoteCfgs {
+		cfg.JetStreamClusterMigrate = true
+	}
+	s.mu.Unlock()
+}
+
 // Will add in the mapping for the account to each server.
 func (c *cluster) addSubjectMapping(account, src, dest string) {
+	c.t.Helper()
+
 	for _, s := range c.servers {
 		if s.ClusterName() != c.name {
 			continue
@@ -961,6 +1062,33 @@ func jsClientConnectEx(t *testing.T, s *Server, domain string, opts ...nats.Opti
 		t.Fatalf("Failed to create client: %v", err)
 	}
 	js, err := nc.JetStream(nats.MaxWait(10*time.Second), nats.Domain(domain))
+	if err != nil {
+		t.Fatalf("Unexpected error getting JetStream context: %v", err)
+	}
+	return nc, js
+}
+
+func jsClientConnectCluster(t *testing.T, c *cluster, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
+	t.Helper()
+
+	var sb strings.Builder
+
+	for _, s := range c.servers {
+		sb.WriteString(s.ClientURL())
+		sb.WriteString(",")
+	}
+
+	return jsClientConnectURL(t, sb.String(), opts...)
+}
+
+func jsClientConnectURL(t *testing.T, url string, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
+	t.Helper()
+
+	nc, err := nats.Connect(url, opts...)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	js, err := nc.JetStream(nats.MaxWait(10 * time.Second))
 	if err != nil {
 		t.Fatalf("Unexpected error getting JetStream context: %v", err)
 	}
@@ -1128,13 +1256,13 @@ func (c *cluster) waitOnServerHealthz(s *Server) {
 	c.t.Helper()
 	expires := time.Now().Add(30 * time.Second)
 	for time.Now().Before(expires) {
-		hs := s.healthz()
+		hs := s.healthz(nil)
 		if hs.Status == "ok" && hs.Error == _EMPTY_ {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	c.t.Fatalf("Expected server %q to eventually return healthz 'ok', but got %q", s, s.healthz().Error)
+	c.t.Fatalf("Expected server %q to eventually return healthz 'ok', but got %q", s, s.healthz(nil).Error)
 }
 
 func (c *cluster) waitOnServerCurrent(s *Server) {
@@ -1235,11 +1363,13 @@ func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
 	}
 
 	if leader == nil {
+		c.shutdown()
 		c.t.Fatalf("Failed to elect a meta-leader")
 	}
 
 	peersSeen := len(leader.JetStreamClusterPeers())
 	c.shutdown()
+
 	if leader == nil {
 		c.t.Fatalf("Expected a cluster leader and fully formed cluster, no leader")
 	} else {
@@ -1258,14 +1388,14 @@ func (c *cluster) removeJetStream(s *Server) {
 		}
 	}
 	cf := c.opts[index].ConfigFile
-	cb, _ := ioutil.ReadFile(cf)
+	cb, _ := os.ReadFile(cf)
 	var sb strings.Builder
 	for _, l := range strings.Split(string(cb), "\n") {
 		if !strings.HasPrefix(strings.TrimSpace(l), "jetstream") {
 			sb.WriteString(l + "\n")
 		}
 	}
-	if err := ioutil.WriteFile(cf, []byte(sb.String()), 0644); err != nil {
+	if err := os.WriteFile(cf, []byte(sb.String()), 0644); err != nil {
 		c.t.Fatalf("Error writing updated config file: %v", err)
 	}
 	if err := s.Reload(); err != nil {
@@ -1346,6 +1476,24 @@ func addStream(t *testing.T, nc *nats.Conn, cfg *StreamConfig) *StreamInfo {
 	return resp.StreamInfo
 }
 
+func updateStream(t *testing.T, nc *nats.Conn, cfg *StreamConfig) *StreamInfo {
+	t.Helper()
+	req, err := json.Marshal(cfg)
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamUpdateT, cfg.Name), req, time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamCreateResponse
+	err = json.Unmarshal(rmsg.Data, &resp)
+	require_NoError(t, err)
+	if resp.Type != JSApiStreamUpdateResponseType {
+		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiStreamUpdateResponseType)
+	}
+	if resp.Error != nil {
+		t.Fatalf("Unexpected error: %+v", resp.Error)
+	}
+	return resp.StreamInfo
+}
+
 // setInActiveDeleteThreshold sets the delete threshold for how long to wait
 // before deleting an inactive consumer.
 func (o *consumer) setInActiveDeleteThreshold(dthresh time.Duration) error {
@@ -1360,4 +1508,110 @@ func (o *consumer) setInActiveDeleteThreshold(dthresh time.Duration) error {
 		o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
 	}
 	return nil
+}
+
+// Net Proxy - For introducing RTT and BW constraints.
+type netProxy struct {
+	listener net.Listener
+	conns    []net.Conn
+	rtt      time.Duration
+	up       int
+	down     int
+	url      string
+	surl     string
+}
+
+func newNetProxy(rtt time.Duration, upRate, downRate int, serverURL string) *netProxy {
+	return createNetProxy(rtt, upRate, downRate, serverURL, true)
+}
+
+func createNetProxy(rtt time.Duration, upRate, downRate int, serverURL string, start bool) *netProxy {
+	hp := net.JoinHostPort("127.0.0.1", "0")
+	l, e := net.Listen("tcp", hp)
+	if e != nil {
+		panic(fmt.Sprintf("Error listening on port: %s, %q", hp, e))
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	proxy := &netProxy{
+		listener: l,
+		rtt:      rtt,
+		up:       upRate,
+		down:     downRate,
+		url:      fmt.Sprintf("nats://127.0.0.1:%d", port),
+		surl:     serverURL,
+	}
+	if start {
+		proxy.start()
+	}
+	return proxy
+}
+
+func (np *netProxy) start() {
+	go func() {
+		for {
+			client, err := np.listener.Accept()
+			if err != nil {
+				return
+			}
+			u, err := url.Parse(np.surl)
+			if err != nil {
+				panic(fmt.Sprintf("Could not parse server URL: %v", err))
+			}
+			server, err := net.DialTimeout("tcp", u.Host, time.Second)
+			if err != nil {
+				panic("Can't connect proxy to NATS server")
+			}
+			np.conns = append(np.conns, client, server)
+			go np.loop(np.rtt, np.up, client, server)
+			go np.loop(np.rtt, np.down, server, client)
+		}
+	}()
+}
+
+func (np *netProxy) clientURL() string {
+	return np.url
+}
+
+func (np *netProxy) routeURL() string {
+	return strings.Replace(np.url, "nats", "nats-route", 1)
+}
+
+func (np *netProxy) loop(rtt time.Duration, tbw int, r, w net.Conn) {
+	delay := rtt / 2
+	const rbl = 8192
+	var buf [rbl]byte
+	ctx := context.Background()
+
+	rl := rate.NewLimiter(rate.Limit(tbw), rbl)
+
+	for fr := true; ; {
+		sr := time.Now()
+		n, err := r.Read(buf[:])
+		if err != nil {
+			return
+		}
+		// RTT delays
+		if fr || time.Since(sr) > 250*time.Millisecond {
+			fr = false
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+		}
+		if err := rl.WaitN(ctx, n); err != nil {
+			return
+		}
+		if _, err = w.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+func (np *netProxy) stop() {
+	if np.listener != nil {
+		np.listener.Close()
+		np.listener = nil
+		for _, c := range np.conns {
+			c.Close()
+		}
+	}
 }

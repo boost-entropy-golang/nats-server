@@ -360,6 +360,7 @@ func TestLeafNodeAccountNotFound(t *testing.T) {
 	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ob.LeafNode.Port))
 
 	oa := DefaultOptions()
+	oa.Cluster.Name = "xyz"
 	oa.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	oa.LeafNode.Remotes = []*RemoteLeafOpts{
 		{
@@ -498,6 +499,7 @@ func TestLeafNodeRTT(t *testing.T) {
 
 	lnBURL, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ob.LeafNode.Port))
 	oa := DefaultOptions()
+	oa.Cluster.Name = "xyz"
 	oa.PingInterval = 15 * time.Millisecond
 	oa.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{lnBURL}}}
 	sa := RunServer(oa)
@@ -562,6 +564,7 @@ func TestLeafNodeRTT(t *testing.T) {
 	// Now check that initial RTT is computed prior to first PingInterval
 	// Get new options to avoid possible race changing the ping interval.
 	ob = DefaultOptions()
+	ob.Cluster.Name = "xyz"
 	ob.PingInterval = time.Minute
 	ob.LeafNode.Host = "127.0.0.1"
 	ob.LeafNode.Port = -1
@@ -857,6 +860,7 @@ func TestLeafNodeLoop(t *testing.T) {
 	sa.SetLogger(l, false, false)
 
 	ob := DefaultOptions()
+	ob.Cluster.Name = "xyz"
 	ob.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	ob.LeafNode.Port = 5678
 	ua, _ := url.Parse("nats://127.0.0.1:1234")
@@ -1262,6 +1266,7 @@ func TestLeafNodePermissions(t *testing.T) {
 
 	u, _ := url.Parse(fmt.Sprintf("nats://%s:%d", lo1.LeafNode.Host, lo1.LeafNode.Port))
 	lo2 := DefaultOptions()
+	lo2.Cluster.Name = "xyz"
 	lo2.LeafNode.ReconnectInterval = 5 * time.Millisecond
 	lo2.LeafNode.connDelay = 100 * time.Millisecond
 	lo2.LeafNode.Remotes = []*RemoteLeafOpts{
@@ -1301,7 +1306,7 @@ func TestLeafNodePermissions(t *testing.T) {
 	// Create a sub on ">" on LN1
 	subAll := natsSubSync(t, nc1, ">")
 	// this should be registered in LN2 (there is 1 sub for LN1 $LDS subject) + SYS IMPORTS
-	checkSubs(ln2.globalAccount(), 8)
+	checkSubs(ln2.globalAccount(), 10)
 
 	// Check deny export clause from messages published from LN2
 	for _, test := range []struct {
@@ -1328,7 +1333,7 @@ func TestLeafNodePermissions(t *testing.T) {
 
 	subAll.Unsubscribe()
 	// Goes down by 1.
-	checkSubs(ln2.globalAccount(), 7)
+	checkSubs(ln2.globalAccount(), 9)
 
 	// We used to make sure we would not do subscriptions however that
 	// was incorrect. We need to check publishes, not the subscriptions.
@@ -1353,7 +1358,7 @@ func TestLeafNodePermissions(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			sub := natsSubSync(t, nc2, test.subSubject)
-			checkSubs(ln2.globalAccount(), 8)
+			checkSubs(ln2.globalAccount(), 10)
 
 			if !test.ok {
 				nc1.Publish(test.pubSubject, []byte("msg"))
@@ -1361,12 +1366,12 @@ func TestLeafNodePermissions(t *testing.T) {
 					t.Fatalf("Did not expect to get the message")
 				}
 			} else {
-				checkSubs(ln1.globalAccount(), 7)
+				checkSubs(ln1.globalAccount(), 9)
 				nc1.Publish(test.pubSubject, []byte("msg"))
 				natsNexMsg(t, sub, time.Second)
 			}
 			sub.Unsubscribe()
-			checkSubs(ln1.globalAccount(), 6)
+			checkSubs(ln1.globalAccount(), 8)
 		})
 	}
 }
@@ -1405,6 +1410,7 @@ func TestLeafNodePermissionsConcurrentAccess(t *testing.T) {
 
 	u, _ := url.Parse(fmt.Sprintf("nats://%s:%d", lo1.LeafNode.Host, lo1.LeafNode.Port))
 	lo2 := DefaultOptions()
+	lo2.Cluster.Name = "xyz"
 	lo2.LeafNode.ReconnectInterval = 5 * time.Millisecond
 	lo2.LeafNode.connDelay = 500 * time.Millisecond
 	lo2.LeafNode.Remotes = []*RemoteLeafOpts{
@@ -1486,8 +1492,8 @@ func TestLeafNodeExportPermissionsNotForSpecialSubs(t *testing.T) {
 	// The deny is totally restrictive, but make sure that we still accept the $LDS, $GR and _GR_ go from LN1.
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
 		// We should have registered the 3 subs from the accepting leafnode.
-		if n := ln2.globalAccount().TotalSubs(); n != 7 {
-			return fmt.Errorf("Expected %d subs, got %v", 7, n)
+		if n := ln2.globalAccount().TotalSubs(); n != 8 {
+			return fmt.Errorf("Expected %d subs, got %v", 8, n)
 		}
 		return nil
 	})
@@ -1674,6 +1680,7 @@ func TestLeafNodeTmpClients(t *testing.T) {
 	// Check with normal leafnode connection that once connected,
 	// the tmp map is also emptied.
 	bo := DefaultOptions()
+	bo.Cluster.Name = "xyz"
 	bo.LeafNode.ReconnectInterval = 5 * time.Millisecond
 	u, err := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ao.LeafNode.Port))
 	if err != nil {
@@ -1729,6 +1736,8 @@ func TestLeafNodeTLSVerifyAndMap(t *testing.T) {
 			defer s.Shutdown()
 
 			slo := DefaultOptions()
+			slo.Cluster.Name = "xyz"
+
 			sltlsc := &tls.Config{}
 			if test.provideCert {
 				tc := &TLSConfigOpts{
@@ -1969,7 +1978,7 @@ func TestLeafNodeOriginClusterInfo(t *testing.T) {
 			remotes [ { url: "nats://127.0.0.1:%d" } ]
 		}
 		cluster {
-			name: "abc"
+			name: "xyz"
 			listen: "127.0.0.1:-1"
 		}
 	`, hopts.LeafNode.Port)))
@@ -1987,8 +1996,8 @@ func TestLeafNodeOriginClusterInfo(t *testing.T) {
 	checkLeafNodeConnected(t, s)
 
 	l = grabLeaf()
-	if rc := l.remoteCluster(); rc != "abc" {
-		t.Fatalf("Expected a remote cluster name of \"abc\", got %q", rc)
+	if rc := l.remoteCluster(); rc != "xyz" {
+		t.Fatalf("Expected a remote cluster name of \"xyz\", got %q", rc)
 	}
 	pcid := l.cid
 
@@ -2265,6 +2274,7 @@ func TestLeafNodeNoDuplicateWithinCluster(t *testing.T) {
 
 	oLeaf1 := DefaultOptions()
 	oLeaf1.ServerName = "leaf1"
+	oLeaf1.Cluster.Name = "xyz"
 	oLeaf1.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
 	leaf1 := RunServer(oLeaf1)
 	defer leaf1.Shutdown()
@@ -2273,6 +2283,7 @@ func TestLeafNodeNoDuplicateWithinCluster(t *testing.T) {
 
 	oLeaf2 := DefaultOptions()
 	oLeaf2.ServerName = "leaf2"
+	oLeaf2.Cluster.Name = "xyz"
 	oLeaf2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
 	oLeaf2.Routes = RoutesFromStr(leaf1ClusterURL)
 	leaf2 := RunServer(oLeaf2)
@@ -2378,11 +2389,13 @@ func TestLeafNodeLMsgSplit(t *testing.T) {
 	remoteLeafs := []*RemoteLeafOpts{{URLs: []*url.URL{u1, u2}}}
 
 	oLeaf1 := DefaultOptions()
+	oLeaf1.Cluster.Name = "xyz"
 	oLeaf1.LeafNode.Remotes = remoteLeafs
 	leaf1 := RunServer(oLeaf1)
 	defer leaf1.Shutdown()
 
 	oLeaf2 := DefaultOptions()
+	oLeaf2.Cluster.Name = "xyz"
 	oLeaf2.LeafNode.Remotes = remoteLeafs
 	oLeaf2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", oLeaf1.Cluster.Port))
 	leaf2 := RunServer(oLeaf2)
@@ -2475,6 +2488,7 @@ func TestLeafNodeRouteParseLSUnsub(t *testing.T) {
 	remoteLeafs := []*RemoteLeafOpts{{URLs: []*url.URL{u2}}}
 
 	oLeaf2 := DefaultOptions()
+	oLeaf2.Cluster.Name = "xyz"
 	oLeaf2.LeafNode.Remotes = remoteLeafs
 	leaf2 := RunServer(oLeaf2)
 	defer leaf2.Shutdown()
@@ -2610,7 +2624,11 @@ func TestLeafNodeTLSConfigReload(t *testing.T) {
 	// Wait for the error
 	select {
 	case err := <-lg.errCh:
-		if !strings.Contains(err, "unknown") {
+		// Since Go 1.18, we had to regenerate certs to not have to use GODEBUG="x509sha1=1"
+		// But on macOS, with our test CA certs, no SCTs included, it will fail
+		// for the reason "x509: “localhost” certificate is not standards compliant"
+		// instead of "unknown authority".
+		if !strings.Contains(err, "unknown") && !strings.Contains(err, "compliant") {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 	case <-time.After(2 * time.Second):
@@ -3296,6 +3314,7 @@ func TestLeafNodeStreamImport(t *testing.T) {
 
 	o2 := DefaultOptions()
 	o2.LeafNode.Port = -1
+	o2.Cluster.Name = "xyz"
 
 	accB := NewAccount("B")
 	if err := accB.AddStreamExport(">", nil); err != nil {
@@ -3380,7 +3399,7 @@ func TestLeafNodeRouteSubWithOrigin(t *testing.T) {
 	r1.Shutdown()
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
 		acc := l2.GlobalAccount()
-		if n := acc.TotalSubs(); n != 3 {
+		if n := acc.TotalSubs(); n != 4 {
 			return fmt.Errorf("Account %q should have 3 subs, got %v", acc.GetName(), n)
 		}
 		return nil
@@ -4348,4 +4367,138 @@ func TestLeafNodeStreamAndShadowSubs(t *testing.T) {
 
 	// Check again
 	subPubAndCheck()
+}
+
+func TestLeafNodeAuthConfigReload(t *testing.T) {
+	template := `
+		listen: 127.0.0.1:-1
+		accounts { test: {} }
+		leaf {
+			listen: "127.0.0.1:7422"
+			tls {
+				cert_file: "../test/configs/certs/server-cert.pem"
+				key_file:  "../test/configs/certs/server-key.pem"
+				ca_file:   "../test/configs/certs/ca.pem"
+			}
+			authorization {
+				# These are only fields allowed atm.
+				users = [ { user: test, password: "s3cret1", account: "test"  } ]
+			}
+		}
+	`
+	conf := createConfFile(t, []byte(template))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	lg := &captureErrorLogger{errCh: make(chan string, 10)}
+	s.SetLogger(lg, false, false)
+
+	// Reload here should work ok.
+	reloadUpdateConfig(t, s, conf, template)
+}
+
+func TestLeafNodeSignatureCB(t *testing.T) {
+	content := `
+		port: -1
+		server_name: OP
+		operator = "../test/configs/nkeys/op.jwt"
+		resolver = MEMORY
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`
+	conf := createConfFile(t, []byte(content))
+	s, opts := RunServerWithConfig(conf)
+	defer removeFile(t, conf)
+	defer s.Shutdown()
+
+	_, akp := createAccount(s)
+	kp, _ := nkeys.CreateUser()
+	pub, _ := kp.PublicKey()
+	nuc := jwt.NewUserClaims(pub)
+	ujwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	lopts := &DefaultTestOptions
+	u, err := url.Parse(fmt.Sprintf("nats://%s:%d", opts.LeafNode.Host, opts.LeafNode.Port))
+	if err != nil {
+		t.Fatalf("Error parsing url: %v", err)
+	}
+	remote := &RemoteLeafOpts{URLs: []*url.URL{u}}
+	remote.SignatureCB = func(nonce []byte) (string, []byte, error) {
+		return "", nil, fmt.Errorf("on purpose")
+	}
+	lopts.LeafNode.Remotes = []*RemoteLeafOpts{remote}
+	lopts.LeafNode.ReconnectInterval = 100 * time.Millisecond
+	sl := RunServer(lopts)
+	defer sl.Shutdown()
+
+	slog := &captureErrorLogger{errCh: make(chan string, 10)}
+	sl.SetLogger(slog, false, false)
+
+	// Now check that the leafnode got the error that the callback returned.
+	select {
+	case err := <-slog.errCh:
+		if !strings.Contains(err, "on purpose") {
+			t.Fatalf("Expected error from cb, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Did not get expected error")
+	}
+
+	sl.Shutdown()
+	// Now check what happens if the connection is closed while in the callback.
+	blockCh := make(chan struct{})
+	remote.SignatureCB = func(nonce []byte) (string, []byte, error) {
+		<-blockCh
+		sig, err := kp.Sign(nonce)
+		return ujwt, sig, err
+	}
+	sl = RunServer(lopts)
+	defer sl.Shutdown()
+
+	// Recreate the logger so that we are sure not to have possible previous errors
+	slog = &captureErrorLogger{errCh: make(chan string, 10)}
+	sl.SetLogger(slog, false, false)
+
+	// Get the leaf connection from the temp clients map and close it.
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		var c *client
+		sl.grMu.Lock()
+		for _, cli := range sl.grTmpClients {
+			c = cli
+		}
+		sl.grMu.Unlock()
+		if c == nil {
+			return fmt.Errorf("Client still not found in temp map")
+		}
+		c.closeConnection(ClientClosed)
+		return nil
+	})
+
+	// Release the callback, and check we get the appropriate error.
+	close(blockCh)
+	select {
+	case err := <-slog.errCh:
+		if !strings.Contains(err, ErrConnectionClosed.Error()) {
+			t.Fatalf("Expected error that connection was closed, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Did not get expected error")
+	}
+
+	sl.Shutdown()
+	// Change to a good CB and now it should work
+	remote.SignatureCB = func(nonce []byte) (string, []byte, error) {
+		sig, err := kp.Sign(nonce)
+		return ujwt, sig, err
+	}
+	sl = RunServer(lopts)
+	defer sl.Shutdown()
+	checkLeafNodeConnected(t, sl)
 }

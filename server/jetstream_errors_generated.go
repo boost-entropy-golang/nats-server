@@ -14,8 +14,8 @@ const (
 	// JSClusterIncompleteErr incomplete results
 	JSClusterIncompleteErr ErrorIdentifier = 10004
 
-	// JSClusterNoPeersErr no suitable peers for placement
-	JSClusterNoPeersErr ErrorIdentifier = 10005
+	// JSClusterNoPeersErrF no suitable peers for placement: {err}
+	JSClusterNoPeersErrF ErrorIdentifier = 10005
 
 	// JSClusterNotActiveErr JetStream not in clustered mode
 	JSClusterNotActiveErr ErrorIdentifier = 10006
@@ -124,6 +124,9 @@ const (
 
 	// JSConsumerMaxWaitingNegativeErr consumer max waiting needs to be positive
 	JSConsumerMaxWaitingNegativeErr ErrorIdentifier = 10087
+
+	// JSConsumerNameContainsPathSeparatorsErr Consumer name can not contain path separators
+	JSConsumerNameContainsPathSeparatorsErr ErrorIdentifier = 10127
 
 	// JSConsumerNameExistErr consumer name already in use
 	JSConsumerNameExistErr ErrorIdentifier = 10013
@@ -308,14 +311,23 @@ const (
 	// JSStreamMoveAndScaleErr can not move and scale a stream in a single update
 	JSStreamMoveAndScaleErr ErrorIdentifier = 10123
 
-	// JSStreamMoveInProgress stream move already in progress
-	JSStreamMoveInProgress ErrorIdentifier = 10124
+	// JSStreamMoveInProgressF stream move already in progress: {msg}
+	JSStreamMoveInProgressF ErrorIdentifier = 10124
+
+	// JSStreamMoveNotInProgress stream move not in progress
+	JSStreamMoveNotInProgress ErrorIdentifier = 10129
 
 	// JSStreamMsgDeleteFailedF Generic message deletion failure error string ({err})
 	JSStreamMsgDeleteFailedF ErrorIdentifier = 10057
 
-	// JSStreamNameExistErr stream name already in use
+	// JSStreamNameContainsPathSeparatorsErr Stream name can not contain path separators
+	JSStreamNameContainsPathSeparatorsErr ErrorIdentifier = 10128
+
+	// JSStreamNameExistErr stream name already in use with a different configuration
 	JSStreamNameExistErr ErrorIdentifier = 10058
+
+	// JSStreamNameExistRestoreFailedErr stream name already in use, cannot restore
+	JSStreamNameExistRestoreFailedErr ErrorIdentifier = 10130
 
 	// JSStreamNotFoundErr stream not found
 	JSStreamNotFoundErr ErrorIdentifier = 10059
@@ -386,7 +398,7 @@ var (
 		JSAccountResourcesExceededErr:              {Code: 400, ErrCode: 10002, Description: "resource limits exceeded for account"},
 		JSBadRequestErr:                            {Code: 400, ErrCode: 10003, Description: "bad request"},
 		JSClusterIncompleteErr:                     {Code: 503, ErrCode: 10004, Description: "incomplete results"},
-		JSClusterNoPeersErr:                        {Code: 400, ErrCode: 10005, Description: "no suitable peers for placement"},
+		JSClusterNoPeersErrF:                       {Code: 400, ErrCode: 10005, Description: "no suitable peers for placement: {err}"},
 		JSClusterNotActiveErr:                      {Code: 500, ErrCode: 10006, Description: "JetStream not in clustered mode"},
 		JSClusterNotAssignedErr:                    {Code: 500, ErrCode: 10007, Description: "JetStream cluster not assigned to this server"},
 		JSClusterNotAvailErr:                       {Code: 503, ErrCode: 10008, Description: "JetStream system temporarily unavailable"},
@@ -423,6 +435,7 @@ var (
 		JSConsumerMaxRequestBatchNegativeErr:       {Code: 400, ErrCode: 10114, Description: "consumer max request batch needs to be > 0"},
 		JSConsumerMaxRequestExpiresToSmall:         {Code: 400, ErrCode: 10115, Description: "consumer max request expires needs to be >= 1ms"},
 		JSConsumerMaxWaitingNegativeErr:            {Code: 400, ErrCode: 10087, Description: "consumer max waiting needs to be positive"},
+		JSConsumerNameContainsPathSeparatorsErr:    {Code: 400, ErrCode: 10127, Description: "Consumer name can not contain path separators"},
 		JSConsumerNameExistErr:                     {Code: 400, ErrCode: 10013, Description: "consumer name already in use"},
 		JSConsumerNameTooLongErrF:                  {Code: 400, ErrCode: 10102, Description: "consumer name is too long, maximum allowed is {max}"},
 		JSConsumerNotFoundErr:                      {Code: 404, ErrCode: 10014, Description: "consumer not found"},
@@ -484,9 +497,12 @@ var (
 		JSStreamMirrorNotUpdatableErr:              {Code: 400, ErrCode: 10055, Description: "stream mirror configuration can not be updated"},
 		JSStreamMismatchErr:                        {Code: 400, ErrCode: 10056, Description: "stream name in subject does not match request"},
 		JSStreamMoveAndScaleErr:                    {Code: 400, ErrCode: 10123, Description: "can not move and scale a stream in a single update"},
-		JSStreamMoveInProgress:                     {Code: 400, ErrCode: 10124, Description: "stream move already in progress"},
+		JSStreamMoveInProgressF:                    {Code: 400, ErrCode: 10124, Description: "stream move already in progress: {msg}"},
+		JSStreamMoveNotInProgress:                  {Code: 400, ErrCode: 10129, Description: "stream move not in progress"},
 		JSStreamMsgDeleteFailedF:                   {Code: 500, ErrCode: 10057, Description: "{err}"},
-		JSStreamNameExistErr:                       {Code: 400, ErrCode: 10058, Description: "stream name already in use"},
+		JSStreamNameContainsPathSeparatorsErr:      {Code: 400, ErrCode: 10128, Description: "Stream name can not contain path separators"},
+		JSStreamNameExistErr:                       {Code: 400, ErrCode: 10058, Description: "stream name already in use with a different configuration"},
+		JSStreamNameExistRestoreFailedErr:          {Code: 400, ErrCode: 10130, Description: "stream name already in use, cannot restore"},
 		JSStreamNotFoundErr:                        {Code: 404, ErrCode: 10059, Description: "stream not found"},
 		JSStreamNotMatchErr:                        {Code: 400, ErrCode: 10060, Description: "expected stream does not match"},
 		JSStreamOfflineErr:                         {Code: 500, ErrCode: 10118, Description: "stream is offline"},
@@ -563,14 +579,20 @@ func NewJSClusterIncompleteError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSClusterIncompleteErr]
 }
 
-// NewJSClusterNoPeersError creates a new JSClusterNoPeersErr error: "no suitable peers for placement"
-func NewJSClusterNoPeersError(opts ...ErrorOption) *ApiError {
+// NewJSClusterNoPeersError creates a new JSClusterNoPeersErrF error: "no suitable peers for placement: {err}"
+func NewJSClusterNoPeersError(err error, opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
 	if ae, ok := eopts.err.(*ApiError); ok {
 		return ae
 	}
 
-	return ApiErrors[JSClusterNoPeersErr]
+	e := ApiErrors[JSClusterNoPeersErrF]
+	args := e.toReplacerArgs([]interface{}{"{err}", err})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
 }
 
 // NewJSClusterNotActiveError creates a new JSClusterNotActiveErr error: "JetStream not in clustered mode"
@@ -967,6 +989,16 @@ func NewJSConsumerMaxWaitingNegativeError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSConsumerMaxWaitingNegativeErr]
+}
+
+// NewJSConsumerNameContainsPathSeparatorsError creates a new JSConsumerNameContainsPathSeparatorsErr error: "Consumer name can not contain path separators"
+func NewJSConsumerNameContainsPathSeparatorsError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerNameContainsPathSeparatorsErr]
 }
 
 // NewJSConsumerNameExistError creates a new JSConsumerNameExistErr error: "consumer name already in use"
@@ -1675,14 +1707,30 @@ func NewJSStreamMoveAndScaleError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSStreamMoveAndScaleErr]
 }
 
-// NewJSStreamMoveInProgressError creates a new JSStreamMoveInProgress error: "stream move already in progress"
-func NewJSStreamMoveInProgressError(opts ...ErrorOption) *ApiError {
+// NewJSStreamMoveInProgressError creates a new JSStreamMoveInProgressF error: "stream move already in progress: {msg}"
+func NewJSStreamMoveInProgressError(msg interface{}, opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
 	if ae, ok := eopts.err.(*ApiError); ok {
 		return ae
 	}
 
-	return ApiErrors[JSStreamMoveInProgress]
+	e := ApiErrors[JSStreamMoveInProgressF]
+	args := e.toReplacerArgs([]interface{}{"{msg}", msg})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSStreamMoveNotInProgressError creates a new JSStreamMoveNotInProgress error: "stream move not in progress"
+func NewJSStreamMoveNotInProgressError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamMoveNotInProgress]
 }
 
 // NewJSStreamMsgDeleteFailedError creates a new JSStreamMsgDeleteFailedF error: "{err}"
@@ -1701,7 +1749,17 @@ func NewJSStreamMsgDeleteFailedError(err error, opts ...ErrorOption) *ApiError {
 	}
 }
 
-// NewJSStreamNameExistError creates a new JSStreamNameExistErr error: "stream name already in use"
+// NewJSStreamNameContainsPathSeparatorsError creates a new JSStreamNameContainsPathSeparatorsErr error: "Stream name can not contain path separators"
+func NewJSStreamNameContainsPathSeparatorsError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamNameContainsPathSeparatorsErr]
+}
+
+// NewJSStreamNameExistError creates a new JSStreamNameExistErr error: "stream name already in use with a different configuration"
 func NewJSStreamNameExistError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
 	if ae, ok := eopts.err.(*ApiError); ok {
@@ -1709,6 +1767,16 @@ func NewJSStreamNameExistError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSStreamNameExistErr]
+}
+
+// NewJSStreamNameExistRestoreFailedError creates a new JSStreamNameExistRestoreFailedErr error: "stream name already in use, cannot restore"
+func NewJSStreamNameExistRestoreFailedError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamNameExistRestoreFailedErr]
 }
 
 // NewJSStreamNotFoundError creates a new JSStreamNotFoundErr error: "stream not found"

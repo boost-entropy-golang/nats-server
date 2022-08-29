@@ -25,12 +25,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -48,7 +48,6 @@ import (
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
-	"golang.org/x/time/rate"
 )
 
 // IMPORTANT: Tests in this file are not executed when running with the -race flag.
@@ -1676,7 +1675,7 @@ func TestNoRaceJetStreamSuperClusterMixedModeMirrors(t *testing.T) {
 				conf = strings.ReplaceAll(conf, "leaf: { ", "#leaf: { ")
 			}
 			return conf
-		})
+		}, nil)
 	defer sc.shutdown()
 
 	// Connect our client to a non JS server
@@ -1980,7 +1979,7 @@ func TestNoRaceJetStreamSuperClusterMixedModeSources(t *testing.T) {
 				conf = strings.ReplaceAll(conf, "leaf: { ", "#leaf: { ")
 			}
 			return conf
-		})
+		}, nil)
 	defer sc.shutdown()
 
 	// Connect our client to a non JS server
@@ -2185,7 +2184,7 @@ func TestNoRaceJetStreamClusterMirrorExpirationAndMissingSequences(t *testing.T)
 	checkMirror(20)
 }
 
-func TestNoRaceLargeActiveOnReplica(t *testing.T) {
+func TestNoRaceJetStreamClusterLargeActiveOnReplica(t *testing.T) {
 	// Uncomment to run.
 	skip(t)
 
@@ -2903,13 +2902,13 @@ func TestNoRaceCompressedConnz(t *testing.T) {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 			defer zr.Close()
-			buf, err = ioutil.ReadAll(zr)
+			buf, err = io.ReadAll(zr)
 			if err != nil && err != io.ErrUnexpectedEOF {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 		case "snappy", "s2":
 			sr := s2.NewReader(bytes.NewReader(buf))
-			buf, err = ioutil.ReadAll(sr)
+			buf, err = io.ReadAll(sr)
 			if err != nil && err != io.ErrUnexpectedEOF {
 				t.Fatalf("Unexpected error: %v", err)
 			}
@@ -3564,6 +3563,8 @@ func TestNoRaceJetStreamClusterCorruptWAL(t *testing.T) {
 	}
 	// Grab underlying raft node and the WAL (filestore) and we will attempt to "corrupt" it.
 	node := o.raftNode().(*raft)
+	// We are doing a stop here to prevent the internal consumer snapshot from happening on exit
+	node.Stop()
 	fs := node.wal.(*fileStore)
 	fcfg, cfg := fs.fcfg, fs.cfg.StreamConfig
 	// Stop all the servers.
@@ -4109,7 +4110,7 @@ func TestNoRaceJetStreamMemstoreWithLargeInteriorDeletes(t *testing.T) {
 // This is related to an issue reported where we were exhausting threads by trying to
 // cleanup too many consumers at the same time.
 // https://github.com/nats-io/nats-server/issues/2742
-func TestNoRaceConsumerFileStoreConcurrentDiskIO(t *testing.T) {
+func TestNoRaceJetStreamConsumerFileStoreConcurrentDiskIO(t *testing.T) {
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
 
@@ -4211,7 +4212,7 @@ func TestNoRaceJetStreamClusterHealthz(t *testing.T) {
 		resp, err := http.Get(url)
 		require_NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require_NoError(t, err)
 		var hs HealthStatus
 		err = json.Unmarshal(body, &hs)
@@ -4453,54 +4454,7 @@ func TestNoRaceJetStreamConsumerFilterPerfDegradation(t *testing.T) {
 	}
 }
 
-func TestNoRaceFileStoreSubjectInfoWithSnapshotCleanup(t *testing.T) {
-	storeDir := createDir(t, JetStreamStoreDir)
-	defer removeDir(t, storeDir)
-
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 1024 * 1024}, StreamConfig{Name: "TEST", Storage: FileStorage})
-	require_NoError(t, err)
-	defer fs.Stop()
-
-	n, msg := 10_000, []byte(strings.Repeat("Z", 1024))
-	for i := 0; i < n; i++ {
-		_, _, err := fs.StoreMsg(fmt.Sprintf("X.%d", i), nil, msg)
-		require_NoError(t, err)
-	}
-
-	// Snapshot causes us to write out per subject info, fss files.
-	// We want to make sure they get cleaned up.
-	sr, err := fs.Snapshot(5*time.Second, false, false)
-	require_NoError(t, err)
-	var buf [4 * 1024 * 1024]byte
-	for {
-		if _, err = sr.Reader.Read(buf[:]); err == io.EOF {
-			break
-		}
-		require_NoError(t, err)
-	}
-
-	var seqs []uint64
-	for i := 1; i <= n; i++ {
-		seqs = append(seqs, uint64(i))
-	}
-	// Randomly delete msgs, make sure we cleanup as we empty the message blocks.
-	rand.Shuffle(len(seqs), func(i, j int) { seqs[i], seqs[j] = seqs[j], seqs[i] })
-
-	for _, seq := range seqs {
-		_, err := fs.RemoveMsg(seq)
-		require_NoError(t, err)
-	}
-
-	// We will have cleanup the main .blk and .idx sans the lmb, but we should not have any *.fss files.
-	fms, err := filepath.Glob(filepath.Join(storeDir, msgDir, fssScanAll))
-	require_NoError(t, err)
-
-	if len(fms) > 0 {
-		t.Fatalf("Expected to find no fss files, found %d", len(fms))
-	}
-}
-
-func TestNoRaceFileStoreKeyFileCleanup(t *testing.T) {
+func TestNoRaceJetStreamFileStoreKeyFileCleanup(t *testing.T) {
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
 
@@ -4547,7 +4501,7 @@ func TestNoRaceFileStoreKeyFileCleanup(t *testing.T) {
 	}
 }
 
-func TestNoRaceMsgIdPerfDuringCatchup(t *testing.T) {
+func TestNoRaceJetStreamMsgIdPerfDuringCatchup(t *testing.T) {
 	// Uncomment to run. Needs to be on a bigger machine. Do not want as part of Travis tests atm.
 	skip(t)
 
@@ -4631,7 +4585,7 @@ func TestNoRaceMsgIdPerfDuringCatchup(t *testing.T) {
 	}
 }
 
-func TestNoRaceRebuildDeDupeAndMemoryPerf(t *testing.T) {
+func TestNoRaceJetStreamRebuildDeDupeAndMemoryPerf(t *testing.T) {
 	skip(t)
 
 	s := RunBasicJetStreamServer()
@@ -4715,7 +4669,7 @@ func TestNoRaceRebuildDeDupeAndMemoryPerf(t *testing.T) {
 	fmt.Printf("Memory: %v\n", friendlyBytes(v.Mem))
 }
 
-func TestNoRaceMemoryUsageOnLimitedStreamWithMirror(t *testing.T) {
+func TestNoRaceJetStreamMemoryUsageOnLimitedStreamWithMirror(t *testing.T) {
 	skip(t)
 
 	s := RunBasicJetStreamServer()
@@ -4768,7 +4722,7 @@ func TestNoRaceMemoryUsageOnLimitedStreamWithMirror(t *testing.T) {
 	fmt.Printf("Memory AFTER SEND: %v\n", friendlyBytes(v.Mem))
 }
 
-func TestNoRaceOrderedConsumerLongRTTPerformance(t *testing.T) {
+func TestNoRaceJetStreamOrderedConsumerLongRTTPerformance(t *testing.T) {
 	skip(t)
 
 	s := RunBasicJetStreamServer()
@@ -5171,6 +5125,7 @@ func TestNoRaceJetStreamClusterInterestPullConsumerStreamLimitBug(t *testing.T) 
 					return
 				}
 			case <-qch:
+				pt.Stop()
 				return
 			}
 		}
@@ -5183,8 +5138,19 @@ func TestNoRaceJetStreamClusterInterestPullConsumerStreamLimitBug(t *testing.T) 
 	for i := 0; i < 100; i++ {
 		go func() {
 			defer wg.Done()
-			_, js := jsClientConnect(t, c.randomServer())
-			sub, err := js.PullSubscribe("foo", "dur")
+			nc := natsConnect(t, c.randomServer().ClientURL())
+			defer nc.Close()
+
+			js, err := nc.JetStream(nats.MaxWait(time.Second))
+			require_NoError(t, err)
+
+			var sub *nats.Subscription
+			for j := 0; j < 5; j++ {
+				sub, err = js.PullSubscribe("foo", "dur")
+				if err == nil {
+					break
+				}
+			}
 			require_NoError(t, err)
 
 			for {
@@ -5230,78 +5196,323 @@ func TestNoRaceJetStreamClusterInterestPullConsumerStreamLimitBug(t *testing.T) 
 	}
 }
 
-// Net Proxy - For introducing RTT and BW constraints.
-type netProxy struct {
-	listener net.Listener
-	conns    []net.Conn
-	url      string
-}
+// Test that all peers have the direct access subs that participate in a queue group,
+// but only when they are current and ready. So we will start with R1, add in messages
+// then scale up while also still adding messages.
+func TestNoRaceJetStreamClusterDirectAccessAllPeersSubs(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
 
-func newNetProxy(rtt time.Duration, upRate, downRate int, serverURL string) *netProxy {
-	hp := net.JoinHostPort("127.0.0.1", "0")
-	l, e := net.Listen("tcp", hp)
-	if e != nil {
-		panic(fmt.Sprintf("Error listening on port: %s, %q", hp, e))
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Start as R1
+	cfg := &StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"kv.>"},
+		MaxMsgsPer:  10,
+		AllowDirect: true,
+		Replicas:    1,
+		Storage:     FileStorage,
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	proxy := &netProxy{listener: l}
-	go func() {
-		client, err := l.Accept()
+	addStream(t, nc, cfg)
+
+	// Seed with enough messages to start then we will scale up while still adding more messages.
+	num, msg := 1000, bytes.Repeat([]byte("XYZ"), 64)
+	for i := 0; i < num; i++ {
+		js.PublishAsync(fmt.Sprintf("kv.%d", i), msg)
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	getSubj := fmt.Sprintf(JSDirectMsgGetT, "TEST")
+	getMsg := func(key string) *nats.Msg {
+		t.Helper()
+		req := []byte(fmt.Sprintf(`{"last_by_subj":%q}`, key))
+		m, err := nc.Request(getSubj, req, time.Second)
+		require_NoError(t, err)
+		require_True(t, m.Header.Get(JSSubject) == key)
+		return m
+	}
+
+	// Just make sure we can succeed here.
+	getMsg("kv.22")
+
+	// Now crank up a go routine to continue sending more messages.
+	qch := make(chan bool)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nc, _ := jsClientConnect(t, c.randomServer())
+			js, _ := nc.JetStream(nats.MaxWait(500 * time.Millisecond))
+			defer nc.Close()
+			for {
+				select {
+				case <-qch:
+					return
+				default:
+					// Send as fast as we can.
+					js.PublishAsync(fmt.Sprintf("kv.%d", rand.Intn(1000)), msg)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Now let's scale up to an R3.
+	cfg.Replicas = 3
+	updateStream(t, nc, cfg)
+
+	// Wait for the stream to register the new replicas and have a leader.
+	checkFor(t, 20*time.Second, 500*time.Millisecond, func() error {
+		si, err := js.StreamInfo("TEST")
 		if err != nil {
-			return
+			return err
 		}
-		server, err := net.DialTimeout("tcp", serverURL[7:], time.Second)
-		if err != nil {
-			panic("Can't connect to NATS server")
+		if si.Cluster == nil {
+			return fmt.Errorf("No cluster yet")
 		}
-		proxy.conns = append(proxy.conns, client, server)
-		go proxy.loop(rtt, upRate, client, server)
-		go proxy.loop(rtt, downRate, server, client)
-	}()
-	proxy.url = fmt.Sprintf("nats://127.0.0.1:%d", port)
-	return proxy
-}
-
-func (np *netProxy) clientURL() string {
-	return np.url
-}
-
-func (np *netProxy) loop(rtt time.Duration, tbw int, r, w net.Conn) {
-	delay := rtt / 2
-	const rbl = 8192
-	var buf [rbl]byte
-	ctx := context.Background()
-
-	rl := rate.NewLimiter(rate.Limit(tbw), rbl)
-
-	for fr := true; ; {
-		sr := time.Now()
-		n, err := r.Read(buf[:])
-		if err != nil {
-			return
+		if si.Cluster.Leader == _EMPTY_ || len(si.Cluster.Replicas) != 2 {
+			return fmt.Errorf("Cluster not ready yet")
 		}
-		// RTT delays
-		if fr || time.Since(sr) > 2*time.Millisecond {
-			fr = false
-			if delay > 0 {
-				time.Sleep(delay)
+		return nil
+	})
+
+	close(qch)
+	wg.Wait()
+
+	// Just make sure we can succeed here.
+	getMsg("kv.22")
+
+	// For each non-leader check that the direct sub fires up.
+	// We just test all, the leader will already have a directSub.
+	for _, s := range c.servers {
+		mset, err := s.GlobalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		checkFor(t, 20*time.Second, 500*time.Millisecond, func() error {
+			mset.mu.RLock()
+			ok := mset.directSub != nil
+			mset.mu.RUnlock()
+			if ok {
+				return nil
+			}
+			return fmt.Errorf("No directSub yet")
+		})
+	}
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	if si.State.Msgs == uint64(num) {
+		t.Fatalf("Expected to see messages increase, got %d", si.State.Msgs)
+	}
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		// Make sure they are all the same from a state perspective.
+		// Leader will have the expected state.
+		lmset, err := c.streamLeader("$G", "TEST").GlobalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		expected := lmset.state()
+
+		for _, s := range c.servers {
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			if state := mset.state(); !reflect.DeepEqual(expected, state) {
+				return fmt.Errorf("Expected %+v, got %+v", expected, state)
 			}
 		}
-		if err := rl.WaitN(ctx, n); err != nil {
-			return
+		return nil
+	})
+
+}
+
+func TestNoRaceJetStreamClusterStreamNamesAndInfosMoreThanAPILimit(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	s := c.randomServer()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	createStream := func(name string) {
+		t.Helper()
+		if _, err := js.AddStream(&nats.StreamConfig{Name: name}); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
 		}
-		if _, err = w.Write(buf[:n]); err != nil {
-			return
+	}
+
+	max := JSApiListLimit
+	if JSApiNamesLimit > max {
+		max = JSApiNamesLimit
+	}
+	max += 10
+
+	for i := 0; i < max; i++ {
+		name := fmt.Sprintf("foo_%d", i)
+		createStream(name)
+	}
+
+	// Not using the JS API here beacause we want to make sure that the
+	// server returns the proper Total count, but also that it does not
+	// send more than when the API limit is in one go.
+	check := func(subj string, limit int) {
+		t.Helper()
+
+		nreq := JSApiStreamNamesRequest{}
+		b, _ := json.Marshal(nreq)
+		msg, err := nc.Request(subj, b, 2*time.Second)
+		require_NoError(t, err)
+
+		nresp := JSApiStreamNamesResponse{}
+		json.Unmarshal(msg.Data, &nresp)
+		if n := nresp.ApiPaged.Total; n != max {
+			t.Fatalf("Expected total to be %v, got %v", max, n)
 		}
+		if n := nresp.ApiPaged.Limit; n != limit {
+			t.Fatalf("Expected limit to be %v, got %v", limit, n)
+		}
+		if n := len(nresp.Streams); n != limit {
+			t.Fatalf("Expected number of streams to be %v, got %v", limit, n)
+		}
+	}
+
+	check(JSApiStreams, JSApiNamesLimit)
+	check(JSApiStreamList, JSApiListLimit)
+}
+
+func TestNoRaceJetStreamFileStoreLargeKVAccessTiming(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	blkSize := uint64(4 * 1024)
+	// Compensate for slower IO on MacOSX
+	if runtime.GOOS == "darwin" {
+		blkSize *= 4
+	}
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize, CacheExpire: 5 * time.Second},
+		StreamConfig{Name: "zzz", Storage: FileStorage, MaxMsgsPer: 1},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	tmpl := "KV.STREAM_NAME.%d"
+	nkeys, val := 100_000, bytes.Repeat([]byte("Z"), 1024)
+
+	for i := 1; i <= nkeys; i++ {
+		subj := fmt.Sprintf(tmpl, i)
+		_, _, err := fs.StoreMsg(subj, nil, val)
+		require_NoError(t, err)
+	}
+
+	first := fmt.Sprintf(tmpl, 1)
+	last := fmt.Sprintf(tmpl, nkeys)
+
+	start := time.Now()
+	_, err = fs.LoadLastMsg(last, nil)
+	require_NoError(t, err)
+	base := time.Since(start)
+
+	start = time.Now()
+	_, err = fs.LoadLastMsg(first, nil)
+	require_NoError(t, err)
+	slow := time.Since(start)
+
+	if slow > 2*base {
+		t.Fatalf("Took too long to look up first key vs last: %v vs %v", base, slow)
+	}
+
+	// time first seq lookup for both as well.
+	// Base will be first in this case.
+	fs.mu.RLock()
+	start = time.Now()
+	fs.firstSeqForSubj(first)
+	base = time.Since(start)
+	start = time.Now()
+	fs.firstSeqForSubj(last)
+	slow = time.Since(start)
+	fs.mu.RUnlock()
+
+	if slow > 2*base {
+		t.Fatalf("Took too long to look up last key by subject vs first: %v vs %v", base, slow)
 	}
 }
 
-func (np *netProxy) stop() {
-	if np.listener != nil {
-		np.listener.Close()
-		np.listener = nil
-		for _, c := range np.conns {
-			c.Close()
-		}
+func TestNoRaceJetStreamKVLock(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
 	}
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "LOCKS"})
+	require_NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	start := make(chan bool)
+
+	var tracker int64
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+			kv, err := js.KeyValue("LOCKS")
+			require_NoError(t, err)
+
+			<-start
+
+			for {
+				last, err := kv.Create("MY_LOCK", []byte("Z"))
+				if err != nil {
+					select {
+					case <-time.After(10 * time.Millisecond):
+						continue
+					case <-ctx.Done():
+						return
+					}
+				}
+
+				if v := atomic.AddInt64(&tracker, 1); v != 1 {
+					t.Logf("TRACKER NOT 1 -> %d\n", v)
+					cancel()
+				}
+
+				time.Sleep(10 * time.Millisecond)
+				if v := atomic.AddInt64(&tracker, -1); v != 0 {
+					t.Logf("TRACKER NOT 0 AFTER RELEASE -> %d\n", v)
+					cancel()
+				}
+
+				err = kv.Delete("MY_LOCK", nats.LastRevision(last))
+				if err != nil {
+					t.Logf("Could not unlock for last %d: %v", last, err)
+				}
+
+				if ctx.Err() != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
 }

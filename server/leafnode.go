@@ -1,4 +1,4 @@
-// Copyright 2019-2021 The NATS Authors
+// Copyright 2019-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,11 +20,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -48,6 +48,9 @@ const leafNodeReconnectDelayAfterLoopDetected = 30 * time.Second
 // When a server receives a message causing a permission violation, the
 // connection is closed and it won't attempt to reconnect for that long.
 const leafNodeReconnectAfterPermViolation = 30 * time.Second
+
+// When we have the same cluster name as the hub.
+const leafNodeReconnectDelayAfterClusterNameSame = 30 * time.Second
 
 // Prefix for loop detection subject
 const leafNodeLoopDetectionSubjectPrefix = "$LDS."
@@ -139,7 +142,7 @@ func (s *Server) solicitLeafNodeRemotes(remotes []*RemoteLeafOpts) {
 		}
 		s.mu.Unlock()
 		if creds != _EMPTY_ {
-			contents, err := ioutil.ReadFile(creds)
+			contents, err := os.ReadFile(creds)
 			defer wipeSlice(contents)
 			if err != nil {
 				s.Errorf("Error reading LeafNode Remote Credentials file %q: %v", creds, err)
@@ -492,8 +495,14 @@ func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool)
 			if url != rURL.Host {
 				ipStr = fmt.Sprintf(" (%s)", url)
 			}
-			s.Debugf("Trying to connect as leafnode to remote server on %q%s", rURL.Host, ipStr)
-			conn, err = natsDialTimeout("tcp", url, dialTimeout)
+			// Some test may want to disable remotes from connecting
+			if s.isLeafConnectDisabled() {
+				s.Debugf("Will not attempt to connect to remote server on %q%s, leafnodes currently disabled", rURL.Host, ipStr)
+				err = ErrLeafNodeDisabled
+			} else {
+				s.Debugf("Trying to connect as leafnode to remote server on %q%s", rURL.Host, ipStr)
+				conn, err = natsDialTimeout("tcp", url, dialTimeout)
+			}
 		}
 		if err != nil {
 			attempts++
@@ -506,6 +515,8 @@ func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool)
 			case <-s.quitCh:
 				return
 			case <-time.After(reconnectDelay):
+				// Check if we should migrate any JetStream assets while this remote is down.
+				s.checkJetStreamMigrate(remote)
 				continue
 			}
 		}
@@ -519,6 +530,50 @@ func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool)
 		s.createLeafNode(conn, rURL, remote, nil)
 		return
 	}
+}
+
+// Check to see if we should migrate any assets from this account.
+func (s *Server) checkJetStreamMigrate(remote *leafNodeCfg) {
+	s.mu.RLock()
+	accName, shouldMigrate := remote.LocalAccount, remote.JetStreamClusterMigrate
+	s.mu.RUnlock()
+
+	if !shouldMigrate {
+		return
+	}
+
+	acc, err := s.LookupAccount(accName)
+	if err != nil {
+		s.Debugf("Error looking up account [%s] checking for JetStream migration on a leafnode", accName)
+		return
+	}
+
+	// Walk all streams looking for any clustered stream, skip otherwise.
+	// If we are the leader force stepdown.
+	for _, mset := range acc.streams() {
+		node := mset.raftNode()
+		if node == nil {
+			// Not R>1
+			continue
+		}
+		// Collect any consumers
+		for _, o := range mset.getConsumers() {
+			if n := o.raftNode(); n != nil && n.Leader() {
+				n.StepDown()
+			}
+		}
+		// Stepdown if this stream was leader.
+		if node.Leader() {
+			node.StepDown()
+		}
+	}
+}
+
+// Helper for checking.
+func (s *Server) isLeafConnectDisabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.leafDisableConnect
 }
 
 // Save off the tlsName for when we use TLS and mix hostnames and IPs. IPs usually
@@ -652,10 +707,26 @@ func (c *client) sendLeafConnect(clusterName string, tlsRequired, headers bool) 
 		DenyPub:   c.leaf.remote.DenyImports,
 	}
 
-	// Check for credentials first, that will take precedence..
-	if creds := c.leaf.remote.Credentials; creds != _EMPTY_ {
+	// If a signature callback is specified, this takes precedence over anything else.
+	if cb := c.leaf.remote.SignatureCB; cb != nil {
+		nonce := c.nonce
+		c.mu.Unlock()
+		jwt, sigraw, err := cb(nonce)
+		c.mu.Lock()
+		if err == nil && c.isClosed() {
+			err = ErrConnectionClosed
+		}
+		if err != nil {
+			c.Errorf("Error signing the nonce: %v", err)
+			return err
+		}
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+		cinfo.JWT, cinfo.Sig = jwt, sig
+
+	} else if creds := c.leaf.remote.Credentials; creds != _EMPTY_ {
+		// Check for credentials first, that will take precedence..
 		c.Debugf("Authenticating with credentials file %q", c.leaf.remote.Credentials)
-		contents, err := ioutil.ReadFile(creds)
+		contents, err := os.ReadFile(creds)
 		if err != nil {
 			c.Errorf("%v", err)
 			return err
@@ -1380,6 +1451,13 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 	proto := &leafConnectInfo{}
 	if err := json.Unmarshal(arg, proto); err != nil {
 		return err
+	}
+
+	// Check for cluster name collisions.
+	if cn := s.cachedClusterName(); cn != _EMPTY_ && proto.Cluster != _EMPTY_ && proto.Cluster == cn {
+		c.sendErrAndErr(ErrLeafNodeHasSameClusterName.Error())
+		c.closeConnection(ClusterNamesIdentical)
+		return ErrLeafNodeHasSameClusterName
 	}
 
 	// Reject if this has Gateway which means that it would be from a gateway
@@ -2228,6 +2306,12 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 			atomic.LoadInt64(&c.srv.gateway.totalQSubs) > 0 {
 			flag |= pmrCollectQueueNames
 		}
+		// If this is a mapped subject that means the mapped interest
+		// is what got us here, but this might not have a queue designation
+		// If that is the case, make sure we ignore to process local queue subscribers.
+		if len(c.pa.mapped) > 0 && len(c.pa.queues) == 0 {
+			flag |= pmrIgnoreEmptyQueueFilter
+		}
 		_, qnames = c.processMsgResults(acc, r, msg, nil, c.pa.subject, c.pa.reply, flag)
 	}
 
@@ -2269,6 +2353,13 @@ func (c *client) leafPermViolation(pub bool, subj []byte) {
 
 // Invoked from generic processErr() for LEAF connections.
 func (c *client) leafProcessErr(errStr string) {
+	// Check if we got a cluster name collision.
+	if strings.Contains(errStr, ErrLeafNodeHasSameClusterName.Error()) {
+		_, delay := c.setLeafConnectDelayIfSoliciting(leafNodeReconnectDelayAfterClusterNameSame)
+		c.Errorf("Leafnode connection dropped with same cluster name error. Delaying attempt to reconnect for %v", delay)
+		return
+	}
+
 	// We will look for Loop detected error coming from the other side.
 	// If we solicit, set the connect delay.
 	if !strings.Contains(errStr, "Loop detected") {

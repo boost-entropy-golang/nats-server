@@ -19,11 +19,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"runtime"
 	"sort"
@@ -158,7 +159,7 @@ func readBodyEx(t *testing.T, url string, status int, content string) []byte {
 	if ct != content {
 		stackFatalf(t, "Expected %s content-type, got %s\n", content, ct)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		stackFatalf(t, "Got an error reading the body: %v\n", err)
 	}
@@ -1672,7 +1673,7 @@ func TestHandleRoot(t *testing.T) {
 		t.Fatalf("Expected a %d response, got %d\n", http.StatusOK, resp.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Expected no error reading body: Got %v\n", err)
 	}
@@ -2010,7 +2011,7 @@ func TestConcurrentMonitoring(t *testing.T) {
 					ech <- fmt.Sprintf("Expected application/json content-type, got %s\n", ct)
 					return
 				}
-				if _, err := ioutil.ReadAll(resp.Body); err != nil {
+				if _, err := io.ReadAll(resp.Body); err != nil {
 					ech <- fmt.Sprintf("Got an error reading the body: %v\n", err)
 					return
 				}
@@ -2182,6 +2183,62 @@ func TestConnzTLSCfg(t *testing.T) {
 		check(varz.Cluster.TLSVerify, varz.Cluster.TLSRequired, varz.Cluster.TLSTimeout)
 		check(varz.Gateway.TLSVerify, varz.Gateway.TLSRequired, varz.Gateway.TLSTimeout)
 		check(varz.LeafNode.TLSVerify, varz.LeafNode.TLSRequired, varz.LeafNode.TLSTimeout)
+	}
+}
+
+func TestConnzTLSPeerCerts(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	tc := &TLSConfigOpts{}
+	tc.CertFile = "../test/configs/certs/server-cert.pem"
+	tc.KeyFile = "../test/configs/certs/server-key.pem"
+	tc.CaFile = "../test/configs/certs/ca.pem"
+	tc.Verify = true
+	tc.Timeout = 2.0
+
+	var err error
+	opts := DefaultMonitorOptions()
+	opts.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL(),
+		nats.ClientCert("../test/configs/certs/client-cert.pem", "../test/configs/certs/client-key.pem"),
+		nats.RootCAs("../test/configs/certs/ca.pem"))
+	defer nc.Close()
+
+	endpoint := fmt.Sprintf("http://%s:%d/connz", opts.HTTPHost, s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		// Without "auth" option, we should not get the details
+		connz := pollConz(t, s, mode, endpoint, nil)
+		require_True(t, len(connz.Conns) == 1)
+		c := connz.Conns[0]
+		if c.TLSPeerCerts != nil {
+			t.Fatalf("Did not expect TLSPeerCerts when auth is not specified: %+v", c.TLSPeerCerts)
+		}
+		// Now specify "auth" option
+		connz = pollConz(t, s, mode, endpoint+"?auth=1", &ConnzOptions{Username: true})
+		require_True(t, len(connz.Conns) == 1)
+		c = connz.Conns[0]
+		if c.TLSPeerCerts == nil {
+			t.Fatal("Expected TLSPeerCerts to be set, was not")
+		} else if len(c.TLSPeerCerts) != 1 {
+			t.Fatalf("Unexpected peer certificates: %+v", c.TLSPeerCerts)
+		} else {
+			for _, d := range c.TLSPeerCerts {
+				if d.Subject != "CN=localhost,OU=nats.io,O=Synadia,ST=California,C=US" {
+					t.Fatalf("Unexpected subject: %s", d.Subject)
+				}
+				if len(d.SubjectPKISha256) != 64 {
+					t.Fatalf("Unexpected spki_sha256: %s", d.SubjectPKISha256)
+				}
+				if len(d.CertSha256) != 64 {
+					t.Fatalf("Unexpected cert_sha256: %s", d.CertSha256)
+				}
+			}
+		}
 	}
 }
 
@@ -2404,7 +2461,7 @@ func Benchmark_VarzHttp(b *testing.B) {
 			b.Fatalf("Expected no error: Got %v\n", err)
 		}
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			b.Fatalf("Got an error reading the body: %v\n", err)
 		}
@@ -3167,6 +3224,9 @@ func TestMonitorGatewayz(t *testing.T) {
 }
 
 func TestMonitorGatewayzAccounts(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	resetPreviousHTTPConnections()
 
 	// Create bunch of Accounts
@@ -3595,7 +3655,7 @@ func TestMonitorOpJWT(t *testing.T) {
 	sa, _ := RunServerWithConfig(conf)
 	defer sa.Shutdown()
 
-	theJWT, err := ioutil.ReadFile("../test/configs/nkeys/op.jwt")
+	theJWT, err := os.ReadFile("../test/configs/nkeys/op.jwt")
 	require_NoError(t, err)
 	theJWT = []byte(strings.Split(string(theJWT), "\n")[1])
 	claim, err := jwt.DecodeOperatorClaims(string(theJWT))
@@ -3854,7 +3914,7 @@ func TestMonitorLeafz(t *testing.T) {
 				t.Fatalf("RTT not tracked?")
 			}
 			// LDS should be only one.
-			if ln.NumSubs != 3 || len(ln.Subs) != 3 {
+			if ln.NumSubs != 4 || len(ln.Subs) != 4 {
 				t.Fatalf("Expected 3 subs, got %v (%v)", ln.NumSubs, ln.Subs)
 			}
 		}
@@ -3864,28 +3924,26 @@ func TestMonitorLeafz(t *testing.T) {
 func TestMonitorAccountz(t *testing.T) {
 	s := RunServer(DefaultMonitorOptions())
 	defer s.Shutdown()
-	body := string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d/accountz", s.MonitorAddr().Port)))
-	if !strings.Contains(body, `$G`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `$SYS`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `"accounts": [`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `"system_account": "$SYS"`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	}
-	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d/accountz?acc=$SYS", s.MonitorAddr().Port)))
-	if !strings.Contains(body, `"account_detail": {`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `"account_name": "$SYS",`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `"subscriptions": 36,`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `"is_system": true,`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	} else if !strings.Contains(body, `"system_account": "$SYS"`) {
-		t.Fatalf("Body missing value. Contains: %s", body)
-	}
+	body := string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s", s.MonitorAddr().Port, AccountzPath)))
+	require_Contains(t, body, `$G`)
+	require_Contains(t, body, `$SYS`)
+	require_Contains(t, body, `"accounts": [`)
+	require_Contains(t, body, `"system_account": "$SYS"`)
+
+	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?acc=$SYS", s.MonitorAddr().Port, AccountzPath)))
+	require_Contains(t, body, `"account_detail": {`)
+	require_Contains(t, body, `"account_name": "$SYS",`)
+	require_Contains(t, body, `"subscriptions": 40,`)
+	require_Contains(t, body, `"is_system": true,`)
+	require_Contains(t, body, `"system_account": "$SYS"`)
+
+	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?unused=1", s.MonitorAddr().Port, AccountStatzPath)))
+	require_Contains(t, body, `"acc": "$G"`)
+	require_Contains(t, body, `"acc": "$SYS"`)
+	require_Contains(t, body, `"sent": {`)
+	require_Contains(t, body, `"received": {`)
+	require_Contains(t, body, `"total_conns": 0,`)
+	require_Contains(t, body, `"leafnodes": 0,`)
 }
 
 func TestMonitorAuthorizedUsers(t *testing.T) {
@@ -3984,17 +4042,10 @@ func TestMonitorAuthorizedUsers(t *testing.T) {
 // Helper function to check that a JS cluster is formed
 func checkForJSClusterUp(t *testing.T, servers ...*Server) {
 	t.Helper()
-	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
-		for _, s := range servers {
-			if !s.JetStreamEnabled() {
-				return fmt.Errorf("jetstream not enabled")
-			}
-			if !s.JetStreamIsCurrent() {
-				return fmt.Errorf("jetstream not current")
-			}
-		}
-		return nil
-	})
+	// We will use the other JetStream helpers here.
+	c := &cluster{t: t, servers: servers}
+	c.checkClusterFormed()
+	c.waitOnClusterReady()
 }
 
 func TestMonitorJszNonJszServer(t *testing.T) {

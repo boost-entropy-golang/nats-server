@@ -22,7 +22,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -1625,7 +1624,7 @@ func TestConnectErrorReports(t *testing.T) {
 	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1673,7 +1672,7 @@ func TestConnectErrorReports(t *testing.T) {
 	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1789,7 +1788,7 @@ func TestReconnectErrorReports(t *testing.T) {
 	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1828,6 +1827,7 @@ func TestReconnectErrorReports(t *testing.T) {
 
 	// Now try with leaf nodes
 	csOpts.Cluster.Port = 0
+	csOpts.Cluster.Name = _EMPTY_
 	csOpts.LeafNode.Host = "127.0.0.1"
 	csOpts.LeafNode.Port = -1
 
@@ -1835,6 +1835,7 @@ func TestReconnectErrorReports(t *testing.T) {
 	defer cs.Shutdown()
 
 	opts.Cluster.Port = 0
+	opts.Cluster.Name = _EMPTY_
 	opts.Routes = nil
 	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", csOpts.LeafNode.Port))
 	opts.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
@@ -1850,7 +1851,7 @@ func TestReconnectErrorReports(t *testing.T) {
 	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1958,7 +1959,7 @@ func TestServerLogsConfigurationFile(t *testing.T) {
 	s := RunServer(o)
 	s.Shutdown()
 
-	log, err := ioutil.ReadFile(file.Name())
+	log, err := os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Error reading log file: %v", err)
 	}

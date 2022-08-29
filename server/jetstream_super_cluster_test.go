@@ -17,17 +17,23 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 )
 
 func TestJetStreamSuperClusterMetaPlacement(t *testing.T) {
@@ -121,8 +127,27 @@ func TestJetStreamSuperClusterUniquePlacementTag(t *testing.T) {
 				"C2-S5": "az:1",
 			}
 			return conf + fmt.Sprintf("\nserver_tags: [cloud:%s-tag, %s]\n", clustername, azTag[serverName])
-		})
+		}, nil)
 	defer s.shutdown()
+
+	inDifferentAz := func(ci *nats.ClusterInfo) (bool, error) {
+		t.Helper()
+		if len(ci.Replicas) == 0 {
+			return true, nil
+		}
+		// if R2 (has replica, this setup does not support R3), test if the server in a cluster picked the same az,
+		// as determined by modulo2 of server number which aligns with az
+		dummy := 0
+		srvnum1 := 0
+		srvnum2 := 0
+		if n, _ := fmt.Sscanf(ci.Leader, "C%d-S%d", &dummy, &srvnum1); n != 2 {
+			return false, fmt.Errorf("couldn't parse leader")
+		}
+		if n, _ := fmt.Sscanf(ci.Replicas[0].Name, "C%d-S%d", &dummy, &srvnum2); n != 2 {
+			return false, fmt.Errorf("couldn't parse replica")
+		}
+		return srvnum1%2 != srvnum2%2, nil
+	}
 
 	nc := natsConnect(t, s.randomServer().ClientURL())
 	defer nc.Close()
@@ -157,18 +182,54 @@ func TestJetStreamSuperClusterUniquePlacementTag(t *testing.T) {
 	} {
 		name := fmt.Sprintf("test-%d", i)
 		t.Run(name, func(t *testing.T) {
-			ci, err := js.AddStream(&nats.StreamConfig{Name: name, Replicas: test.replicas, Placement: test.placement})
+			si, err := js.AddStream(&nats.StreamConfig{Name: name, Replicas: test.replicas, Placement: test.placement})
 			if test.fail {
 				require_Error(t, err)
-				require_Equal(t, err.Error(), "insufficient resources")
+				require_Contains(t, err.Error(), "no suitable peers for placement")
 				return
 			}
 			require_NoError(t, err)
 			if test.cluster != _EMPTY_ {
-				require_Equal(t, ci.Cluster.Name, test.cluster)
+				require_Equal(t, si.Cluster.Name, test.cluster)
 			}
+			// skip placement test if tags call for a particular az
+			if test.placement != nil && len(test.placement.Tags) > 0 {
+				for _, tag := range test.placement.Tags {
+					if strings.HasPrefix(tag, "az:") {
+						return
+					}
+				}
+			}
+			diff, err := inDifferentAz(si.Cluster)
+			require_NoError(t, err)
+			require_True(t, diff)
 		})
 	}
+
+	t.Run("scale-up-test", func(t *testing.T) {
+		// create enough streams so we hit it eventually
+		for i := 0; i < 10; i++ {
+			cfg := &nats.StreamConfig{Name: fmt.Sprintf("scale-up-%d", i), Replicas: 1,
+				Placement: &nats.Placement{Tags: []string{"cloud:C2-tag"}}}
+			si, err := js.AddStream(cfg)
+			require_NoError(t, err)
+			require_Equal(t, si.Cluster.Name, "C2")
+			cfg.Replicas = 2
+			si, err = js.UpdateStream(cfg)
+			require_NoError(t, err)
+			require_Equal(t, si.Cluster.Name, "C2")
+			checkFor(t, 10, 250*time.Millisecond, func() error {
+				if si, err := js.StreamInfo(cfg.Name); err != nil {
+					return err
+				} else if diff, err := inDifferentAz(si.Cluster); err != nil {
+					return err
+				} else if !diff {
+					return fmt.Errorf("not in different AZ")
+				}
+				return nil
+			})
+		}
+	})
 }
 
 func TestJetStreamSuperClusterBasics(t *testing.T) {
@@ -356,6 +417,9 @@ func TestJetStreamSuperClusterPeerReassign(t *testing.T) {
 }
 
 func TestJetStreamSuperClusterInterestOnlyMode(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	template := `
 		listen: 127.0.0.1:-1
 		server_name: %s
@@ -461,7 +525,7 @@ func TestJetStreamSuperClusterConnectionCount(t *testing.T) {
 
 	sysNc := natsConnect(t, sc.randomServer().ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
 	defer sysNc.Close()
-	_, err := sysNc.Request(fmt.Sprintf(accReqSubj, "ONE", "CONNS"), nil, 100*time.Millisecond)
+	_, err := sysNc.Request(fmt.Sprintf(accDirectReqSubj, "ONE", "CONNS"), nil, 100*time.Millisecond)
 	// this is a timeout as the server only responds when it has connections....
 	// not convinced this should be that way, but also not the issue to investigate.
 	require_True(t, err == nats.ErrTimeout)
@@ -506,7 +570,7 @@ func TestJetStreamSuperClusterConnectionCount(t *testing.T) {
 	// There should be no active NATS CLIENT connections, but we still need
 	// to wait a little bit...
 	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		_, err := sysNc.Request(fmt.Sprintf(accReqSubj, "ONE", "CONNS"), nil, 100*time.Millisecond)
+		_, err := sysNc.Request(fmt.Sprintf(accDirectReqSubj, "ONE", "CONNS"), nil, 100*time.Millisecond)
 		if err != nats.ErrTimeout {
 			return fmt.Errorf("Expected timeout, got %v", err)
 		}
@@ -792,8 +856,8 @@ func TestJetStreamSuperClusterLeafNodesWithSharedSystemAccountAndDifferentDomain
 		Replicas:  2,
 		Placement: &nats.Placement{Cluster: pcn},
 	})
-	if err == nil || !strings.Contains(err.Error(), "insufficient resources") {
-		t.Fatalf("Expected insufficient resources, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "no suitable peers for placement") {
+		t.Fatalf("Expected no suitable peers for placement, got: %v", err)
 	}
 }
 
@@ -1324,8 +1388,7 @@ func TestJetStreamSuperClusterOverflowPlacement(t *testing.T) {
 		MaxBytes:  2 * 1024 * 1024 * 1024,
 		Placement: &nats.Placement{Cluster: pcn},
 	})
-	require_Error(t, err, NewJSInsufficientResourcesError(), NewJSStorageResourcesExceededError())
-
+	require_Contains(t, err.Error(), "no suitable peers for placement")
 	// Now test actual overflow placement. So try again with no placement designation.
 	// This will test the peer picker's logic since they are updated at this point and the meta leader
 	// knows it can not place it in C2.
@@ -1441,7 +1504,7 @@ func TestJetStreamSuperClusterStreamTagPlacement(t *testing.T) {
 			Subjects:  []string{"foo"},
 			Placement: &nats.Placement{Tags: tags},
 		})
-		require_Error(t, err, NewJSInsufficientResourcesError())
+		require_Contains(t, err.Error(), "no suitable peers for placement")
 	}
 
 	placeErr("C1", []string{"cloud:GCP", "country:US"})
@@ -1722,7 +1785,7 @@ func TestJetStreamSuperClusterMovingStreamsAndConsumers(t *testing.T) {
 				Replicas:  replicas,
 				Placement: &nats.Placement{Tags: []string{"cloud:aws"}},
 			})
-			require_Error(t, err, NewJSStreamMoveInProgressError())
+			require_Contains(t, err.Error(), "stream move already in progress")
 
 			checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
 				si, err := js.StreamInfo("MOVE")
@@ -1756,7 +1819,7 @@ func TestJetStreamSuperClusterMovingStreamsAndConsumers(t *testing.T) {
 
 			// Should see the cluster designation and leader switch to C2.
 			// We should also shrink back down to original replica count.
-			checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+			checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
 				si, err := js.StreamInfo("MOVE")
 				if err != nil {
 					return err
@@ -1780,7 +1843,7 @@ func TestJetStreamSuperClusterMovingStreamsAndConsumers(t *testing.T) {
 			si, err = js.StreamInfo("MOVE")
 			require_NoError(t, err)
 
-			if si.State != initialState {
+			if !reflect.DeepEqual(si.State, initialState) {
 				t.Fatalf("States do not match after migration:\n%+v\nvs\n%+v", si.State, initialState)
 			}
 
@@ -1980,7 +2043,7 @@ func TestJetStreamSuperClusterMovingStreamsWithMirror(t *testing.T) {
 		mi, err := js.StreamInfo("MIRROR")
 		require_NoError(t, err)
 
-		if si.State != mi.State {
+		if !reflect.DeepEqual(si.State, mi.State) {
 			return fmt.Errorf("Expected mirror to be the same, got %+v vs %+v", mi.State, si.State)
 		}
 		return nil
@@ -2032,6 +2095,7 @@ func TestJetStreamSuperClusterMovingStreamAndMoveBack(t *testing.T) {
 
 			checkMove := func(cluster string) {
 				t.Helper()
+				sc.waitOnStreamLeader("$G", "TEST")
 				checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
 					si, err := js.StreamInfo("TEST")
 					if err != nil {
@@ -2272,7 +2336,7 @@ func TestJetStreamSuperClusterMaxHaAssets(t *testing.T) {
 	`, 3, 2,
 		func(serverName, clusterName, storeDir, conf string) string {
 			return conf
-		})
+		}, nil)
 	defer sc.shutdown()
 
 	// speed up statsz reporting
@@ -2324,7 +2388,8 @@ func TestJetStreamSuperClusterMaxHaAssets(t *testing.T) {
 	waitStatsz(3, 1)
 	_, err = js.AddStream(&nats.StreamConfig{Name: "S3", Replicas: 3, Placement: &nats.Placement{Cluster: "C1"}})
 	require_Error(t, err)
-	require_Equal(t, err.Error(), "insufficient resources")
+	require_Contains(t, err.Error(), "no suitable peers for placement")
+	require_Contains(t, err.Error(), "misc: 3")
 	require_NoError(t, js.DeleteStream("S1"))
 	waitStatsz(3, 2)
 	waitStatsz(3, 1)
@@ -2357,7 +2422,8 @@ func TestJetStreamSuperClusterMaxHaAssets(t *testing.T) {
 	require_Equal(t, err.Error(), "insufficient resources")
 	_, err = js.UpdateStream(&nats.StreamConfig{Name: "S2", Replicas: 3, Placement: &nats.Placement{Cluster: "C2"}})
 	require_Error(t, err)
-	require_Equal(t, err.Error(), "insufficient resources")
+	require_Contains(t, err.Error(), "no suitable peers for placement")
+	require_Contains(t, err.Error(), "misc: 3")
 }
 
 func TestJetStreamSuperClusterStreamAlternates(t *testing.T) {
@@ -2482,4 +2548,1288 @@ func TestJetStreamSuperClusterStateOnRestartPreventsConsumerRecovery(t *testing.
 	if o := mset.lookupConsumer("dlc"); o == nil {
 		t.Fatalf("Consumer was not properly restarted")
 	}
+}
+
+// We allow mirrors to opt-in to direct get in a distributed queue group.
+func TestJetStreamSuperClusterStreamDirectGetMirrorQueueGroup(t *testing.T) {
+	sc := createJetStreamTaggedSuperCluster(t)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.randomServer())
+	defer nc.Close()
+
+	// C1
+	// Do by hand for now.
+	cfg := &StreamConfig{
+		Name:        "SOURCE",
+		Subjects:    []string{"kv.>"},
+		MaxMsgsPer:  1,
+		Placement:   &Placement{Tags: []string{"cloud:aws", "country:us"}},
+		AllowDirect: true,
+		Replicas:    3,
+		Storage:     MemoryStorage,
+	}
+	addStream(t, nc, cfg)
+
+	num := 100
+	for i := 0; i < num; i++ {
+		js.PublishAsync(fmt.Sprintf("kv.%d", i), []byte("VAL"))
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	// C2
+	cfg = &StreamConfig{
+		Name:         "M1",
+		Mirror:       &StreamSource{Name: "SOURCE"},
+		Placement:    &Placement{Tags: []string{"cloud:gcp", "country:uk"}},
+		MirrorDirect: true,
+		Storage:      MemoryStorage,
+	}
+	addStream(t, nc, cfg)
+
+	// C3 (clustered)
+	cfg = &StreamConfig{
+		Name:         "M2",
+		Mirror:       &StreamSource{Name: "SOURCE"},
+		Replicas:     3,
+		Placement:    &Placement{Tags: []string{"country:jp"}},
+		MirrorDirect: true,
+		Storage:      MemoryStorage,
+	}
+	addStream(t, nc, cfg)
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("M2")
+		require_NoError(t, err)
+		if si.State.Msgs != uint64(num) {
+			return fmt.Errorf("Expected %d msgs, got state: %d", num, si.State.Msgs)
+		}
+		return nil
+	})
+
+	// Since last one was an R3, check and wait for the direct subscription.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		sl := sc.clusterForName("C3").streamLeader("$G", "M2")
+		if mset, err := sl.GlobalAccount().lookupStream("M2"); err == nil {
+			mset.mu.RLock()
+			ok := mset.mirror.dsub != nil
+			mset.mu.RUnlock()
+			if ok {
+				return nil
+			}
+		}
+		return fmt.Errorf("No dsub yet")
+	})
+
+	// Always do a direct get to the source, but check that we are getting answers from the mirrors when connected to their cluster.
+	getSubj := fmt.Sprintf(JSDirectMsgGetT, "SOURCE")
+	req := []byte(`{"last_by_subj":"kv.22"}`)
+	getMsg := func(c *nats.Conn) *nats.Msg {
+		m, err := c.Request(getSubj, req, time.Second)
+		require_NoError(t, err)
+		require_True(t, string(m.Data) == "VAL")
+		require_True(t, m.Header.Get(JSSequence) == "23")
+		require_True(t, m.Header.Get(JSSubject) == "kv.22")
+		return m
+	}
+
+	// C1 -> SOURCE
+	nc, _ = jsClientConnect(t, sc.clusterForName("C1").randomServer())
+	defer nc.Close()
+
+	m := getMsg(nc)
+	require_True(t, m.Header.Get(JSStream) == "SOURCE")
+
+	// C2 -> M1
+	nc, _ = jsClientConnect(t, sc.clusterForName("C2").randomServer())
+	defer nc.Close()
+
+	m = getMsg(nc)
+	require_True(t, m.Header.Get(JSStream) == "M1")
+
+	// C3 -> M2
+	nc, _ = jsClientConnect(t, sc.clusterForName("C3").randomServer())
+	defer nc.Close()
+
+	m = getMsg(nc)
+	require_True(t, m.Header.Get(JSStream) == "M2")
+}
+
+func TestJetStreamSuperClusterTagInducedMoveCancel(t *testing.T) {
+	server := map[string]struct{}{}
+	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterTempl, 4, 2,
+		func(serverName, clusterName, storeDir, conf string) string {
+			server[serverName] = struct{}{}
+			return fmt.Sprintf("%s\nserver_tags: [%s]", conf, clusterName)
+		}, nil)
+	defer sc.shutdown()
+
+	// Client based API
+	c := sc.randomCluster()
+	srv := c.randomNonLeader()
+	nc, js := jsClientConnect(t, srv)
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Placement: &nats.Placement{Tags: []string{"C1"}},
+		Replicas:  3,
+	}
+	siCreate, err := js.AddStream(cfg)
+	require_NoError(t, err)
+	require_Equal(t, siCreate.Cluster.Name, "C1")
+
+	toSend := uint64(1_000)
+	for i := uint64(0); i < toSend; i++ {
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+	}
+
+	ncsys, err := nats.Connect(srv.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer ncsys.Close()
+
+	// cause a move by altering placement tags
+	cfg.Placement.Tags = []string{"C2"}
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+
+	rmsg, err := ncsys.Request(fmt.Sprintf(JSApiServerStreamCancelMoveT, "$G", "TEST"), nil, 5*time.Second)
+	require_NoError(t, err)
+	var cancelResp JSApiStreamUpdateResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
+	if cancelResp.Error != nil && ErrorIdentifier(cancelResp.Error.ErrCode) == JSStreamMoveNotInProgress {
+		t.Skip("This can happen with delays, when Move completed before Cancel", cancelResp.Error)
+		return
+	}
+	require_True(t, cancelResp.Error == nil)
+
+	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
+		si, err := js.StreamInfo("TEST")
+		require_NoError(t, err)
+		if si.Config.Placement != nil {
+			return fmt.Errorf("expected placement to be cleared got: %+v", si.Config.Placement)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamSuperClusterMoveCancel(t *testing.T) {
+	usageTickOld := usageTick
+	usageTick = 250 * time.Millisecond
+	defer func() {
+		usageTick = usageTickOld
+	}()
+
+	server := map[string]struct{}{}
+	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterTempl, 4, 2,
+		func(serverName, clusterName, storeDir, conf string) string {
+			server[serverName] = struct{}{}
+			return fmt.Sprintf("%s\nserver_tags: [%s]", conf, serverName)
+		}, nil)
+	defer sc.shutdown()
+
+	// Client based API
+	c := sc.randomCluster()
+	srv := c.randomNonLeader()
+	nc, js := jsClientConnect(t, srv)
+	defer nc.Close()
+
+	siCreate, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	streamPeerSrv := []string{siCreate.Cluster.Leader, siCreate.Cluster.Replicas[0].Name, siCreate.Cluster.Replicas[1].Name}
+	// determine empty server
+	for _, s := range streamPeerSrv {
+		delete(server, s)
+	}
+	// pick left over server in same cluster as other server
+	emptySrv := _EMPTY_
+	for s := range server {
+		// server name is prefixed with cluster name
+		if strings.HasPrefix(s, c.name) {
+			emptySrv = s
+			break
+		}
+	}
+
+	expectedPeers := map[string]struct{}{
+		string(getHash(streamPeerSrv[0])): {},
+		string(getHash(streamPeerSrv[1])): {},
+		string(getHash(streamPeerSrv[2])): {},
+	}
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "DUR", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{InactiveThreshold: time.Hour, AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+	ephName := ci.Name
+
+	toSend := uint64(1_000)
+	for i := uint64(0); i < toSend; i++ {
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+	}
+
+	serverEmpty := func(fromSrv string) error {
+		if jszAfter, err := c.serverByName(fromSrv).Jsz(nil); err != nil {
+			return fmt.Errorf("could not fetch JS info for server: %v", err)
+		} else if jszAfter.Streams != 0 {
+			return fmt.Errorf("empty server still has %d streams", jszAfter.Streams)
+		} else if jszAfter.Consumers != 0 {
+			return fmt.Errorf("empty server still has %d consumers", jszAfter.Consumers)
+		} else if jszAfter.Bytes != 0 {
+			return fmt.Errorf("empty server still has %d storage", jszAfter.Store)
+		}
+		return nil
+	}
+
+	checkSrvInvariant := func(s *Server, expectedPeers map[string]struct{}) error {
+		js, cc := s.getJetStreamCluster()
+		js.mu.Lock()
+		defer js.mu.Unlock()
+		if sa, ok := cc.streams["$G"]["TEST"]; !ok {
+			return fmt.Errorf("stream not found")
+		} else if len(sa.Group.Peers) != len(expectedPeers) {
+			return fmt.Errorf("stream peer group size not %d, but %d", len(expectedPeers), len(sa.Group.Peers))
+		} else if da, ok := sa.consumers["DUR"]; !ok {
+			return fmt.Errorf("durable not found")
+		} else if len(da.Group.Peers) != len(expectedPeers) {
+			return fmt.Errorf("durable peer group size not %d, but %d", len(expectedPeers), len(da.Group.Peers))
+		} else if ea, ok := sa.consumers[ephName]; !ok {
+			return fmt.Errorf("ephemeral not found")
+		} else if len(ea.Group.Peers) != 1 {
+			return fmt.Errorf("ephemeral peer group size not 1, but %d", len(ea.Group.Peers))
+		} else if _, ok := expectedPeers[ea.Group.Peers[0]]; !ok {
+			return fmt.Errorf("ephemeral peer not an expected peer")
+		} else {
+			for _, p := range sa.Group.Peers {
+				if _, ok := expectedPeers[p]; !ok {
+					return fmt.Errorf("peer not expected")
+				}
+				found := false
+				for _, dp := range da.Group.Peers {
+					if p == dp {
+						found = true
+						break
+					}
+				}
+				if !found {
+					fmt.Printf("durable peer group does not match stream peer group")
+				}
+			}
+		}
+		return nil
+	}
+
+	ncsys, err := nats.Connect(srv.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer ncsys.Close()
+
+	time.Sleep(2 * usageTick)
+	aiBefore, err := js.AccountInfo()
+	require_NoError(t, err)
+
+	for _, moveFromSrv := range streamPeerSrv {
+		moveReq, err := json.Marshal(&JSApiMetaServerStreamMoveRequest{Server: moveFromSrv, Tags: []string{emptySrv}})
+		require_NoError(t, err)
+		rmsg, err := ncsys.Request(fmt.Sprintf(JSApiServerStreamMoveT, "$G", "TEST"), moveReq, 5*time.Second)
+		require_NoError(t, err)
+		var moveResp JSApiStreamUpdateResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &moveResp))
+		require_True(t, moveResp.Error == nil)
+
+		rmsg, err = ncsys.Request(fmt.Sprintf(JSApiServerStreamCancelMoveT, "$G", "TEST"), nil, 5*time.Second)
+		require_NoError(t, err)
+		var cancelResp JSApiStreamUpdateResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &cancelResp))
+		if cancelResp.Error != nil && ErrorIdentifier(cancelResp.Error.ErrCode) == JSStreamMoveNotInProgress {
+			t.Skip("This can happen with delays, when Move completed before Cancel", cancelResp.Error)
+			return
+		}
+		require_True(t, cancelResp.Error == nil)
+
+		for _, sExpected := range streamPeerSrv {
+			s := c.serverByName(sExpected)
+			require_True(t, s.JetStreamIsStreamAssigned("$G", "TEST"))
+			checkFor(t, 20*time.Second, 100*time.Millisecond, func() error { return checkSrvInvariant(s, expectedPeers) })
+		}
+		checkFor(t, 10*time.Second, 100*time.Millisecond, func() error { return serverEmpty(emptySrv) })
+		checkFor(t, 3*usageTick, 100*time.Millisecond, func() error {
+			if aiAfter, err := js.AccountInfo(); err != nil {
+				return err
+			} else if aiAfter.Store != aiBefore.Store {
+				return fmt.Errorf("store before %d and after %d don't match", aiBefore.Store, aiAfter.Store)
+			} else {
+				return nil
+			}
+		})
+	}
+}
+
+func TestJetStreamSuperClusterDoubleStreamMove(t *testing.T) {
+	// Shorten this test by factor of 2.
+	scaleDownDelayTicks = 0
+	defer func() { scaleDownDelayTicks = defaultScaleDownDelayTicks }()
+
+	server := map[string]struct{}{}
+	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterTempl, 4, 2,
+		func(serverName, clusterName, storeDir, conf string) string {
+			server[serverName] = struct{}{}
+			return fmt.Sprintf("%s\nserver_tags: [%s]", conf, serverName)
+		}, nil)
+	defer sc.shutdown()
+
+	// Client based API
+	c := sc.randomCluster()
+	srv := c.randomNonLeader()
+	nc, js := jsClientConnect(t, srv)
+	defer nc.Close()
+
+	siCreate, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	srvMoveList := []string{siCreate.Cluster.Leader, siCreate.Cluster.Replicas[0].Name, siCreate.Cluster.Replicas[1].Name}
+	// determine empty server
+	for _, s := range srvMoveList {
+		delete(server, s)
+	}
+	// pick left over server in same cluster as other server
+	for s := range server {
+		// server name is prefixed with cluster name
+		if strings.HasPrefix(s, c.name) {
+			srvMoveList = append(srvMoveList, s)
+			break
+		}
+	}
+
+	servers := []*Server{
+		c.serverByName(srvMoveList[0]),
+		c.serverByName(srvMoveList[1]),
+		c.serverByName(srvMoveList[2]),
+		c.serverByName(srvMoveList[3]), // starts out empty
+	}
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "DUR", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{InactiveThreshold: time.Hour, AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+	ephName := ci.Name
+
+	toSend := uint64(100)
+	for i := uint64(0); i < toSend; i++ {
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+	}
+
+	ncsys, err := nats.Connect(srv.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer ncsys.Close()
+
+	move := func(fromSrv string, toTags ...string) {
+		sEmpty := c.serverByName(fromSrv)
+		jszBefore, err := sEmpty.Jsz(nil)
+		require_NoError(t, err)
+		require_True(t, jszBefore.Streams == 1)
+
+		moveReq, err := json.Marshal(&JSApiMetaServerStreamMoveRequest{
+			Server: fromSrv, Tags: toTags})
+		require_NoError(t, err)
+		rmsg, err := ncsys.Request(fmt.Sprintf(JSApiServerStreamMoveT, "$G", "TEST"), moveReq, 100*time.Second)
+		require_NoError(t, err)
+		var moveResp JSApiStreamUpdateResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &moveResp))
+		require_True(t, moveResp.Error == nil)
+	}
+
+	serverEmpty := func(fromSrv string) error {
+		if jszAfter, err := c.serverByName(fromSrv).Jsz(nil); err != nil {
+			return fmt.Errorf("could not fetch JS info for server: %v", err)
+		} else if jszAfter.Streams != 0 {
+			return fmt.Errorf("empty server still has %d streams", jszAfter.Streams)
+		} else if jszAfter.Consumers != 0 {
+			return fmt.Errorf("empty server still has %d consumers", jszAfter.Consumers)
+		} else if jszAfter.Store != 0 {
+			return fmt.Errorf("empty server still has %d storage", jszAfter.Store)
+		}
+		return nil
+	}
+
+	moveComplete := func(toSrv string, expectedSet ...string) error {
+		eSet := map[string]int{}
+		foundInExpected := false
+		for i, sExpected := range expectedSet {
+			eSet[sExpected] = i
+			s := c.serverByName(sExpected)
+			if !s.JetStreamIsStreamAssigned("$G", "TEST") {
+				return fmt.Errorf("expected stream to be assigned to %s", sExpected)
+			}
+			// test list order invariant
+			js, cc := s.getJetStreamCluster()
+			sExpHash := string(getHash(sExpected))
+			js.mu.Lock()
+			if sa, ok := cc.streams["$G"]["TEST"]; !ok {
+				js.mu.Unlock()
+				return fmt.Errorf("stream not found in cluster")
+			} else if len(sa.Group.Peers) != 3 {
+				js.mu.Unlock()
+				return fmt.Errorf("peers not reset")
+			} else if sa.Group.Peers[i] != sExpHash {
+				js.mu.Unlock()
+				return fmt.Errorf("stream: expected peer %s on index %d, got %s/%s",
+					sa.Group.Peers[i], i, sExpHash, sExpected)
+			} else if ca, ok := sa.consumers["DUR"]; !ok {
+				js.mu.Unlock()
+				return fmt.Errorf("durable not found in stream")
+			} else {
+				found := false
+				for _, peer := range ca.Group.Peers {
+					if peer == sExpHash {
+						found = true
+						break
+					}
+				}
+				if !found {
+					js.mu.Unlock()
+					return fmt.Errorf("consumer expected peer %s/%s bud didn't find in %+v",
+						sExpHash, sExpected, ca.Group.Peers)
+				}
+				if ephA, ok := sa.consumers[ephName]; ok {
+					if len(ephA.Group.Peers) != 1 {
+						return fmt.Errorf("ephemeral peers not reset")
+					}
+					foundInExpected = foundInExpected || (ephA.Group.Peers[0] == cc.meta.ID())
+				}
+			}
+			js.mu.Unlock()
+		}
+		if len(expectedSet) > 0 && !foundInExpected {
+			return fmt.Errorf("ephemeral peer not expected")
+		}
+		for _, s := range servers {
+			if jszAfter, err := c.serverByName(toSrv).Jsz(nil); err != nil {
+				return fmt.Errorf("could not fetch JS info for server: %v", err)
+			} else if jszAfter.Messages != toSend {
+				return fmt.Errorf("messages not yet copied, got %d, expected %d", jszAfter.Messages, toSend)
+			}
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+			if si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second)); err != nil {
+				return fmt.Errorf("could not fetch stream info: %v", err)
+			} else if len(si.Cluster.Replicas)+1 != si.Config.Replicas {
+				return fmt.Errorf("not yet downsized replica should be empty has: %d %s",
+					len(si.Cluster.Replicas), si.Cluster.Leader)
+			} else if si.Cluster.Leader == _EMPTY_ {
+				return fmt.Errorf("leader not found")
+			} else if len(expectedSet) > 0 {
+				if _, ok := eSet[si.Cluster.Leader]; !ok {
+					return fmt.Errorf("leader %s not in expected set %+v", si.Cluster.Leader, eSet)
+				} else if _, ok := eSet[si.Cluster.Replicas[0].Name]; !ok {
+					return fmt.Errorf("leader %s not in expected set %+v", si.Cluster.Replicas[0].Name, eSet)
+				} else if _, ok := eSet[si.Cluster.Replicas[1].Name]; !ok {
+					return fmt.Errorf("leader %s not in expected set %+v", si.Cluster.Replicas[1].Name, eSet)
+				}
+			}
+			nc.Close()
+		}
+		return nil
+	}
+
+	moveAndCheck := func(from, to string, expectedSet ...string) {
+		move(from, to)
+		checkFor(t, 40*time.Second, 100*time.Millisecond, func() error { return moveComplete(to, expectedSet...) })
+		checkFor(t, 20*time.Second, 100*time.Millisecond, func() error { return serverEmpty(from) })
+	}
+
+	checkFor(t, 20*time.Second, 1000*time.Millisecond, func() error { return serverEmpty(srvMoveList[3]) })
+	// first iteration establishes order of server 0-2 (the internal order in the server could be 1,0,2)
+	moveAndCheck(srvMoveList[0], srvMoveList[3])
+	moveAndCheck(srvMoveList[1], srvMoveList[0])
+	moveAndCheck(srvMoveList[2], srvMoveList[1])
+	moveAndCheck(srvMoveList[3], srvMoveList[2], srvMoveList[0], srvMoveList[1], srvMoveList[2])
+	// second iteration iterates in order
+	moveAndCheck(srvMoveList[0], srvMoveList[3], srvMoveList[1], srvMoveList[2], srvMoveList[3])
+	moveAndCheck(srvMoveList[1], srvMoveList[0], srvMoveList[2], srvMoveList[3], srvMoveList[0])
+	moveAndCheck(srvMoveList[2], srvMoveList[1], srvMoveList[3], srvMoveList[0], srvMoveList[1])
+	moveAndCheck(srvMoveList[3], srvMoveList[2], srvMoveList[0], srvMoveList[1], srvMoveList[2])
+	// iterate in the opposite direction and establish order 2-0
+	moveAndCheck(srvMoveList[2], srvMoveList[3], srvMoveList[0], srvMoveList[1], srvMoveList[3])
+	moveAndCheck(srvMoveList[1], srvMoveList[2], srvMoveList[0], srvMoveList[3], srvMoveList[2])
+	moveAndCheck(srvMoveList[0], srvMoveList[1], srvMoveList[3], srvMoveList[2], srvMoveList[1])
+	moveAndCheck(srvMoveList[3], srvMoveList[0], srvMoveList[2], srvMoveList[1], srvMoveList[0])
+	// move server in the middle of list
+	moveAndCheck(srvMoveList[1], srvMoveList[3], srvMoveList[2], srvMoveList[0], srvMoveList[3])
+	moveAndCheck(srvMoveList[0], srvMoveList[1], srvMoveList[2], srvMoveList[3], srvMoveList[1])
+	moveAndCheck(srvMoveList[3], srvMoveList[0], srvMoveList[2], srvMoveList[1], srvMoveList[0])
+	// repeatedly use end
+	moveAndCheck(srvMoveList[0], srvMoveList[3], srvMoveList[2], srvMoveList[1], srvMoveList[3])
+	moveAndCheck(srvMoveList[3], srvMoveList[0], srvMoveList[2], srvMoveList[1], srvMoveList[0])
+	moveAndCheck(srvMoveList[0], srvMoveList[3], srvMoveList[2], srvMoveList[1], srvMoveList[3])
+	moveAndCheck(srvMoveList[3], srvMoveList[0], srvMoveList[2], srvMoveList[1], srvMoveList[0])
+}
+
+func TestJetStreamSuperClusterPeerEvacuationAndStreamReassignment(t *testing.T) {
+	// Shorten this test by factor of 2.
+	scaleDownDelayTicks = 0
+	defer func() { scaleDownDelayTicks = defaultScaleDownDelayTicks }()
+
+	s := createJetStreamSuperClusterWithTemplateAndModHook(t, jsClusterTempl, 4, 2,
+		func(serverName, clusterName, storeDir, conf string) string {
+			return fmt.Sprintf("%s\nserver_tags: [cluster:%s, server:%s]", conf, clusterName, serverName)
+		}, nil)
+	defer s.shutdown()
+
+	c := s.clusterForName("C1")
+
+	// Client based API
+	srv := c.randomNonLeader()
+	nc, js := jsClientConnect(t, srv)
+	defer nc.Close()
+
+	test := func(t *testing.T, r int, moveTags []string, targetCluster string, testMigrateTo bool, listFrom bool) {
+		si, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: r,
+		})
+		require_NoError(t, err)
+		defer js.DeleteStream("TEST")
+		startSet := map[string]struct{}{
+			si.Cluster.Leader: {},
+		}
+		for _, p := range si.Cluster.Replicas {
+			startSet[p.Name] = struct{}{}
+		}
+
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "DUR", AckPolicy: nats.AckExplicitPolicy})
+		require_NoError(t, err)
+
+		sub, err := js.SubscribeSync("foo")
+		require_NoError(t, err)
+
+		for i := 0; i < 100; i++ {
+			_, err = js.Publish("foo", nil)
+			require_NoError(t, err)
+		}
+
+		toMoveFrom := si.Cluster.Leader
+		if !listFrom {
+			toMoveFrom = _EMPTY_
+		}
+		sLdr := c.serverByName(si.Cluster.Leader)
+		jszBefore, err := sLdr.Jsz(nil)
+		require_NoError(t, err)
+		require_True(t, jszBefore.Streams == 1)
+		require_True(t, jszBefore.Consumers >= 1)
+		require_True(t, jszBefore.Store != 0)
+
+		migrateToServer := _EMPTY_
+		if testMigrateTo {
+			// find an empty server
+			for _, s := range c.servers {
+				name := s.Name()
+				found := si.Cluster.Leader == name
+				if !found {
+					for _, r := range si.Cluster.Replicas {
+						if r.Name == name {
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					migrateToServer = name
+					break
+				}
+			}
+			jszAfter, err := c.serverByName(migrateToServer).Jsz(nil)
+			require_NoError(t, err)
+			require_True(t, jszAfter.Streams == 0)
+
+			moveTags = append(moveTags, fmt.Sprintf("server:%s", migrateToServer))
+		}
+
+		ncsys, err := nats.Connect(srv.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+		require_NoError(t, err)
+		defer ncsys.Close()
+
+		moveReq, err := json.Marshal(&JSApiMetaServerStreamMoveRequest{
+			Server: toMoveFrom, Tags: moveTags})
+		require_NoError(t, err)
+		rmsg, err := ncsys.Request(fmt.Sprintf(JSApiServerStreamMoveT, "$G", "TEST"), moveReq, 100*time.Second)
+		require_NoError(t, err)
+		var moveResp JSApiStreamUpdateResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &moveResp))
+		require_True(t, moveResp.Error == nil)
+
+		// test move to particular server
+		if testMigrateTo {
+			toSrv := c.serverByName(migrateToServer)
+			checkFor(t, 20*time.Second, 1000*time.Millisecond, func() error {
+				jszAfter, err := toSrv.Jsz(nil)
+				if err != nil {
+					return fmt.Errorf("could not fetch JS info for server: %v", err)
+				}
+				if jszAfter.Streams != 1 {
+					return fmt.Errorf("server expected to have one stream, has %d", jszAfter.Streams)
+				}
+				return nil
+			})
+		}
+		// Now wait until the stream is now current.
+		checkFor(t, 50*time.Second, 100*time.Millisecond, func() error {
+			si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
+			if err != nil {
+				return fmt.Errorf("could not fetch stream info: %v", err)
+			}
+			if si.Cluster.Leader == toMoveFrom {
+				return fmt.Errorf("peer not removed yet: %+v", toMoveFrom)
+			}
+			if si.Cluster.Leader == _EMPTY_ {
+				return fmt.Errorf("no leader yet")
+			}
+			if len(si.Cluster.Replicas) != r-1 {
+				return fmt.Errorf("not yet downsized replica should be %d has: %d", r-1, len(si.Cluster.Replicas))
+			}
+			if si.Config.Replicas != r {
+				return fmt.Errorf("bad replica count %d", si.Config.Replicas)
+			}
+			if si.Cluster.Name != targetCluster {
+				return fmt.Errorf("stream expected in %s but found in %s", si.Cluster.Name, targetCluster)
+			}
+			sNew := s.serverByName(si.Cluster.Leader)
+			if jszNew, err := sNew.Jsz(nil); err != nil {
+				return err
+			} else if jszNew.Streams != 1 {
+				return fmt.Errorf("new leader has %d streams, not one", jszNew.Streams)
+			} else if jszNew.Store != jszBefore.Store {
+				return fmt.Errorf("new leader has %d storage, should have %d", jszNew.Store, jszBefore.Store)
+			}
+			return nil
+		})
+		// test draining
+		checkFor(t, 20*time.Second, 1000*time.Millisecond, func() error {
+			if !listFrom {
+				// when needed determine which server move moved away from
+				si, err := js.StreamInfo("TEST", nats.MaxWait(2*time.Second))
+				if err != nil {
+					return fmt.Errorf("could not fetch stream info: %v", err)
+				}
+				for n := range startSet {
+					if n != si.Cluster.Leader {
+						found := false
+						for _, p := range si.Cluster.Replicas {
+							if p.Name == n {
+								found = true
+								break
+							}
+						}
+						if !found {
+							toMoveFrom = n
+						}
+					}
+				}
+			}
+			if toMoveFrom == _EMPTY_ {
+				return fmt.Errorf("server to move away from not found")
+			}
+			sEmpty := c.serverByName(toMoveFrom)
+			jszAfter, err := sEmpty.Jsz(nil)
+			if err != nil {
+				return fmt.Errorf("could not fetch JS info for server: %v", err)
+			}
+			if jszAfter.Streams != 0 {
+				return fmt.Errorf("empty server still has %d streams", jszAfter.Streams)
+			}
+			if jszAfter.Consumers != 0 {
+				return fmt.Errorf("empty server still has %d consumers", jszAfter.Consumers)
+			}
+			if jszAfter.Store != 0 {
+				return fmt.Errorf("empty server still has %d storage", jszAfter.Store)
+			}
+			return nil
+		})
+		// consume messages from ephemeral consumer
+		for i := 0; i < 100; i++ {
+			_, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+		}
+	}
+
+	for i := 1; i <= 3; i++ {
+		t.Run(fmt.Sprintf("r%d", i), func(t *testing.T) {
+			test(t, i, nil, "C1", false, true)
+		})
+		t.Run(fmt.Sprintf("r%d-explicit", i), func(t *testing.T) {
+			test(t, i, nil, "C1", true, true)
+		})
+		t.Run(fmt.Sprintf("r%d-nosrc", i), func(t *testing.T) {
+			test(t, i, nil, "C1", false, false)
+		})
+	}
+
+	t.Run("r3-cluster-move", func(t *testing.T) {
+		test(t, 3, []string{"cluster:C2"}, "C2", false, false)
+	})
+	t.Run("r3-cluster-move-nosrc", func(t *testing.T) {
+		test(t, 3, []string{"cluster:C2"}, "C2", false, true)
+	})
+}
+
+func TestJetStreamSuperClusterMirrorInheritsAllowDirect(t *testing.T) {
+	sc := createJetStreamTaggedSuperCluster(t)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:              "KV",
+		Subjects:          []string{"key.*"},
+		Placement:         &nats.Placement{Tags: []string{"cloud:aws", "country:us"}},
+		MaxMsgsPerSubject: 1,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:      "M",
+		Mirror:    &nats.StreamSource{Name: "KV"},
+		Placement: &nats.Placement{Tags: []string{"cloud:gcp", "country:uk"}},
+	})
+	require_NoError(t, err)
+
+	// Do direct grab for now.
+	resp, err := nc.Request(fmt.Sprintf(JSApiStreamInfoT, "M"), nil, time.Second)
+	require_NoError(t, err)
+	var si StreamInfo
+	err = json.Unmarshal(resp.Data, &si)
+	require_NoError(t, err)
+
+	if !si.Config.MirrorDirect {
+		t.Fatalf("Expected MirrorDirect to be inherited as true")
+	}
+}
+
+func TestJetStreamSuperClusterSystemLimitsPlacement(t *testing.T) {
+	const largeSystemLimit = 1024
+	const smallSystemLimit = 512
+
+	tmpl := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {
+			max_mem_store: _MAXMEM_
+			max_file_store: _MAXFILE_
+			store_dir: '%s',
+		}
+		server_tags: [
+			_TAG_
+		]
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+
+		accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+	`
+	storeCnf := func(serverName, clusterName, storeDir, conf string) string {
+		switch {
+		case strings.HasPrefix(serverName, "C1"):
+			conf = strings.Replace(conf, "_MAXMEM_", fmt.Sprint(largeSystemLimit), 1)
+			conf = strings.Replace(conf, "_MAXFILE_", fmt.Sprint(largeSystemLimit), 1)
+			return strings.Replace(conf, "_TAG_", serverName, 1)
+		case strings.HasPrefix(serverName, "C2"):
+			conf = strings.Replace(conf, "_MAXMEM_", fmt.Sprint(smallSystemLimit), 1)
+			conf = strings.Replace(conf, "_MAXFILE_", fmt.Sprint(smallSystemLimit), 1)
+			return strings.Replace(conf, "_TAG_", serverName, 1)
+		default:
+			return conf
+		}
+	}
+
+	sCluster := createJetStreamSuperClusterWithTemplateAndModHook(t, tmpl, 3, 2, storeCnf, nil)
+	defer sCluster.shutdown()
+
+	requestLeaderStepDown := func(clientURL string) error {
+		nc, err := nats.Connect(clientURL)
+		if err != nil {
+			return err
+		}
+		defer nc.Close()
+
+		ncResp, err := nc.Request(JSApiLeaderStepDown, nil, 3*time.Second)
+		if err != nil {
+			return err
+		}
+
+		var resp JSApiLeaderStepDownResponse
+		if err := json.Unmarshal(ncResp.Data, &resp); err != nil {
+			return err
+		}
+		if resp.Error != nil {
+			return resp.Error
+		}
+		if !resp.Success {
+			return fmt.Errorf("leader step down request not successful")
+		}
+
+		return nil
+	}
+
+	// Force large cluster to be leader
+	var largeLeader *Server
+	err := checkForErr(15*time.Second, 500*time.Millisecond, func() error {
+		// Range over cluster A, which is the large cluster.
+		servers := sCluster.clusters[0].servers
+		for _, s := range servers {
+			if s.JetStreamIsLeader() {
+				largeLeader = s
+				return nil
+			}
+		}
+
+		if err := requestLeaderStepDown(servers[0].ClientURL()); err != nil {
+			return fmt.Errorf("failed to request leader step down: %s", err)
+		}
+		return fmt.Errorf("leader is not in large cluster")
+	})
+	if err != nil {
+		t.Skipf("failed to get desired layout: %s", err)
+	}
+
+	getStreams := func(jsm nats.JetStreamManager) []string {
+		var streams []string
+		for s := range jsm.StreamNames() {
+			streams = append(streams, s)
+		}
+		return streams
+	}
+	nc, js := jsClientConnect(t, largeLeader)
+	defer nc.Close()
+
+	cases := []struct {
+		name           string
+		storage        nats.StorageType
+		createMaxBytes int64
+		serverTag      string
+		wantErr        bool
+	}{
+		{
+			name:           "file create large stream on small cluster b0",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C2-S1",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on small cluster b0",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C2-S1",
+			wantErr:        true,
+		},
+		{
+			name:           "file create large stream on small cluster b1",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C2-S2",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on small cluster b1",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C2-S2",
+			wantErr:        true,
+		},
+		{
+			name:           "file create large stream on small cluster b2",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C2-S3",
+			wantErr:        true,
+		},
+		{
+			name:           "memory create large stream on small cluster b2",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C2-S3",
+			wantErr:        true,
+		},
+		{
+			name:           "file create large stream on large cluster a0",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C1-S1",
+		},
+		{
+			name:           "memory create large stream on large cluster a0",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C1-S1",
+		},
+		{
+			name:           "file create large stream on large cluster a1",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C1-S2",
+		},
+		{
+			name:           "memory create large stream on large cluster a1",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C1-S2",
+		},
+		{
+			name:           "file create large stream on large cluster a2",
+			storage:        nats.FileStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C1-S3",
+		},
+		{
+			name:           "memory create large stream on large cluster a2",
+			storage:        nats.MemoryStorage,
+			createMaxBytes: smallSystemLimit + 1,
+			serverTag:      "C1-S3",
+		},
+	}
+	for i := 0; i < len(cases) && !t.Failed(); i++ {
+		c := cases[i]
+		t.Run(c.name, func(st *testing.T) {
+			var clusterName string
+			if strings.HasPrefix(c.serverTag, "a") {
+				clusterName = "cluster-a"
+			} else if strings.HasPrefix(c.serverTag, "b") {
+				clusterName = "cluster-b"
+			}
+
+			if s := getStreams(js); len(s) != 0 {
+				st.Fatalf("unexpected stream count, got=%d, want=0", len(s))
+			}
+
+			streamName := fmt.Sprintf("TEST-%s", c.serverTag)
+			si, err := js.AddStream(&nats.StreamConfig{
+				Name:     streamName,
+				Subjects: []string{"foo"},
+				Storage:  c.storage,
+				MaxBytes: c.createMaxBytes,
+				Placement: &nats.Placement{
+					Cluster: clusterName,
+					Tags:    []string{c.serverTag},
+				},
+			})
+			if c.wantErr && err == nil {
+				if s := getStreams(js); len(s) != 1 {
+					st.Logf("unexpected stream count, got=%d, want=1, streams=%v", len(s), s)
+				}
+
+				cfg := si.Config
+				st.Fatalf("unexpected success, maxBytes=%d, cluster=%s, tags=%v",
+					cfg.MaxBytes, cfg.Placement.Cluster, cfg.Placement.Tags)
+			} else if !c.wantErr && err != nil {
+				if s := getStreams(js); len(s) != 0 {
+					st.Logf("unexpected stream count, got=%d, want=0, streams=%v", len(s), s)
+				}
+
+				require_NoError(st, err)
+			}
+
+			if err == nil {
+				if s := getStreams(js); len(s) != 1 {
+					st.Fatalf("unexpected stream count, got=%d, want=1", len(s))
+				}
+			}
+			// Delete regardless.
+			js.DeleteStream(streamName)
+		})
+	}
+}
+
+func TestJetStreamSuperClusterStreamCathupLongRTT(t *testing.T) {
+	skip(t)
+
+	// Make C2 far away.
+	gwm := gwProxyMap{
+		"C2": &gwProxy{
+			rtt:  300 * time.Millisecond,
+			up:   1 * 1024 * 1024 * 1024, // 1gbit
+			down: 1 * 1024 * 1024 * 1024, // 1gbit
+		},
+	}
+	sc := createJetStreamTaggedSuperClusterWithGWProxy(t, gwm)
+	defer sc.shutdown()
+
+	nc, js := jsClientConnect(t, sc.randomServer())
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:              "TEST",
+		Subjects:          []string{"chunk.*"},
+		Placement:         &nats.Placement{Tags: []string{"cloud:aws", "country:us"}},
+		Replicas:          3,
+		MaxMsgsPerSubject: 1,
+	}
+
+	// Place a stream in C1.
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	chunk := bytes.Repeat([]byte("Z"), 1000*1024) // ~1MB
+	// 256 MB
+	for i := 0; i < 256; i++ {
+		subj := fmt.Sprintf("chunk.%d", i)
+		js.PublishAsync(subj, chunk)
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	// C2, slow RTT.
+	cfg.Placement = &nats.Placement{Tags: []string{"cloud:gcp", "country:uk"}}
+	_, err = js.UpdateStream(cfg)
+	require_NoError(t, err)
+
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("TEST")
+		if err != nil {
+			return err
+		}
+		if si.Cluster.Name != "C2" {
+			return fmt.Errorf("Wrong cluster: %q", si.Cluster.Name)
+		}
+		if si.Cluster.Leader == _EMPTY_ {
+			return fmt.Errorf("No leader yet")
+		} else if !strings.HasPrefix(si.Cluster.Leader, "C2-") {
+			return fmt.Errorf("Wrong leader: %q", si.Cluster.Leader)
+		}
+		// Now we want to see that we shrink back to original.
+		if len(si.Cluster.Replicas) != cfg.Replicas-1 {
+			return fmt.Errorf("Expected %d replicas, got %d", cfg.Replicas-1, len(si.Cluster.Replicas))
+		}
+		return nil
+	})
+}
+
+func TestJetStreamSuperClusterMixedModeSwitchToInterestOnlyStaticConfig(t *testing.T) {
+	tmpl := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: { domain: ngs, max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf: { listen: 127.0.0.1:-1 }
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+		accounts {
+			ONE {
+				users = [  { user: "one", pass: "pwd" } ]
+				jetstream: enabled
+			}
+			TWO { users = [  { user: "two", pass: "pwd" } ] }
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+	`
+	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, tmpl, 5, 3,
+		func(serverName, clusterName, storeDir, conf string) string {
+			sname := serverName[strings.Index(serverName, "-")+1:]
+			switch sname {
+			case "S4", "S5":
+				conf = strings.ReplaceAll(conf, "jetstream: { ", "#jetstream: { ")
+			default:
+				conf = strings.ReplaceAll(conf, "leaf: { ", "#leaf: { ")
+			}
+			return conf
+		}, nil)
+	defer sc.shutdown()
+
+	// Connect our client to a non JS server
+	c := sc.randomCluster()
+	var s *Server
+	for _, as := range c.servers {
+		if !as.JetStreamEnabled() {
+			s = as
+			break
+		}
+	}
+	if s == nil {
+		t.Fatal("Did not find a non JS server!")
+	}
+	nc, js := jsClientConnect(t, s, nats.UserInfo("one", "pwd"))
+	defer nc.Close()
+
+	// Just create a stream and then make sure that all gateways have switched
+	// to interest-only mode.
+	si, err := js.AddStream(&nats.StreamConfig{Name: "interest", Replicas: 3})
+	require_NoError(t, err)
+
+	sc.waitOnStreamLeader("ONE", "interest")
+
+	check := func(accName string) {
+		t.Helper()
+		for _, c := range sc.clusters {
+			for _, s := range c.servers {
+				// Check only JS servers outbound GW connections
+				if !s.JetStreamEnabled() {
+					continue
+				}
+				opts := s.getOpts()
+				for _, gw := range opts.Gateway.Gateways {
+					if gw.Name == opts.Gateway.Name {
+						continue
+					}
+					checkGWInterestOnlyMode(t, s, gw.Name, accName)
+				}
+			}
+		}
+	}
+	// Starting v2.9.0, all accounts should be switched to interest-only mode
+	check("ONE")
+	check("TWO")
+
+	var gwsa [16]*client
+	gws := gwsa[:0]
+
+	s = sc.serverByName(si.Cluster.Leader)
+	// Get the GW outbound connections
+	s.getOutboundGatewayConnections(&gws)
+	for _, gwc := range gws {
+		gwc.mu.Lock()
+		gwc.nc.Close()
+		gwc.mu.Unlock()
+	}
+	waitForOutboundGateways(t, s, 2, 5*time.Second)
+	check("ONE")
+	check("TWO")
+}
+
+func TestJetStreamSuperClusterMixedModeSwitchToInterestOnlyOperatorConfig(t *testing.T) {
+	kp, _ := nkeys.FromSeed(oSeed)
+
+	skp, _ := nkeys.CreateAccount()
+	spub, _ := skp.PublicKey()
+	nac := jwt.NewAccountClaims(spub)
+	sjwt, err := nac.Encode(kp)
+	require_NoError(t, err)
+
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac = jwt.NewAccountClaims(apub)
+	// Set some limits to enable JS.
+	nac.Limits.JetStreamLimits.DiskStorage = 1024 * 1024
+	nac.Limits.JetStreamLimits.Streams = 10
+	ajwt, err := nac.Encode(kp)
+	require_NoError(t, err)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, spub) {
+			w.Write([]byte(sjwt))
+		} else {
+			w.Write([]byte(ajwt))
+		}
+	}))
+	defer ts.Close()
+
+	operator := fmt.Sprintf(`
+		operator: %s
+		resolver: URL("%s/ngs/v1/accounts/jwt/")
+	`, ojwt, ts.URL)
+
+	tmpl := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: { domain: ngs, max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf: { listen: 127.0.0.1:-1 }
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + operator
+	sc := createJetStreamSuperClusterWithTemplateAndModHook(t, tmpl, 5, 3,
+		func(serverName, clusterName, storeDir, conf string) string {
+			conf = strings.ReplaceAll(conf, "system_account: \"$SYS\"", fmt.Sprintf("system_account: \"%s\"", spub))
+			sname := serverName[strings.Index(serverName, "-")+1:]
+			switch sname {
+			case "S4", "S5":
+				conf = strings.ReplaceAll(conf, "jetstream: { ", "#jetstream: { ")
+			default:
+				conf = strings.ReplaceAll(conf, "leaf: { ", "#leaf: { ")
+			}
+			return conf
+		}, nil)
+	defer sc.shutdown()
+
+	// Connect our client to a non JS server
+	c := sc.randomCluster()
+	var s *Server
+	for _, as := range c.servers {
+		if !as.JetStreamEnabled() {
+			s = as
+			break
+		}
+	}
+	if s == nil {
+		t.Fatal("Did not find a non JS server!")
+	}
+	nc, js := jsClientConnect(t, s, createUserCreds(t, nil, akp))
+	defer nc.Close()
+
+	// Just create a stream and then make sure that all gateways have switched
+	// to interest-only mode.
+	si, err := js.AddStream(&nats.StreamConfig{Name: "interest", Replicas: 3})
+	require_NoError(t, err)
+
+	sc.waitOnStreamLeader(apub, "interest")
+
+	check := func(s *Server) {
+		opts := s.getOpts()
+		for _, gw := range opts.Gateway.Gateways {
+			if gw.Name == opts.Gateway.Name {
+				continue
+			}
+			checkGWInterestOnlyMode(t, s, gw.Name, apub)
+		}
+	}
+	s = sc.serverByName(si.Cluster.Leader)
+	check(s)
+
+	// Let's cause a leadership change and verify that it still works.
+	_, err = nc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, "interest"), nil, time.Second)
+	require_NoError(t, err)
+	sc.waitOnStreamLeader(apub, "interest")
+
+	si, err = js.StreamInfo("interest")
+	require_NoError(t, err)
+	s = sc.serverByName(si.Cluster.Leader)
+	check(s)
+
+	var gwsa [16]*client
+	gws := gwsa[:0]
+	// Get the GW outbound connections
+	s.getOutboundGatewayConnections(&gws)
+	for _, gwc := range gws {
+		gwc.mu.Lock()
+		gwc.nc.Close()
+		gwc.mu.Unlock()
+	}
+	waitForOutboundGateways(t, s, 2, 5*time.Second)
+	check(s)
 }

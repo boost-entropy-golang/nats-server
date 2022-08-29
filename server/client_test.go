@@ -2526,6 +2526,7 @@ func TestClientClampMaxSubsErrReport(t *testing.T) {
 	s1.SetLogger(l, false, false)
 
 	o2 := DefaultOptions()
+	o2.Cluster.Name = "xyz"
 	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", o1.LeafNode.Port))
 	o2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
 	s2 := RunServer(o2)
@@ -2565,4 +2566,20 @@ func TestClientClampMaxSubsErrReport(t *testing.T) {
 	natsSubSync(t, nc, "baz")
 	natsSubSync(t, nc, "bat")
 	check()
+}
+
+func TestClientDenySysGroupSub(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL(), nats.ErrorHandler(func(*nats.Conn, *nats.Subscription, error) {}))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	_, err = nc.QueueSubscribeSync("foo", sysGroup)
+	require_NoError(t, err)
+	nc.Flush()
+	err = nc.LastError()
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "Permissions Violation")
 }

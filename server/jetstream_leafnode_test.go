@@ -18,7 +18,6 @@ package server
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -485,7 +484,7 @@ leafnodes:{
 					require_NoError(t, err)
 				} else {
 					require_Error(t, err)
-					require_Contains(t, err.Error(), "insufficient resources")
+					require_Contains(t, err.Error(), "no suitable peers for placement")
 				}
 				ncL := natsConnect(t, fmt.Sprintf("nats://a1:a1@127.0.0.1:%d", sLA.opts.Port))
 				defer ncL.Close()
@@ -500,7 +499,7 @@ leafnodes:{
 					require_NoError(t, err)
 				} else {
 					require_Error(t, err)
-					require_Contains(t, err.Error(), "insufficient resources")
+					require_Contains(t, err.Error(), "no suitable peers for placement")
 				}
 			}
 			clusterLnCnt := func(expected int) error {
@@ -891,7 +890,7 @@ leafnodes: {
 		require_True(t, err == nats.ErrNoResponders)
 
 		// Add in default domain and restart server
-		require_NoError(t, ioutil.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
+		require_NoError(t, os.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
 			sHub.opts.Port,
 			"disabled",
 			"disabled",
@@ -914,7 +913,7 @@ leafnodes: {
 		sdHub := createDir(t, JetStreamStoreDir)
 		defer os.RemoveAll(sdHub)
 		jsEnabled := fmt.Sprintf(`{ domain: "%s", store_dir: '%s', max_mem: 100Mb, max_file: 100Mb }`, domain, sdHub)
-		require_NoError(t, ioutil.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
+		require_NoError(t, os.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
 			sHubUpd1.opts.Port,
 			"disabled",
 			jsEnabled,
@@ -935,7 +934,7 @@ leafnodes: {
 
 		// Enable jetstream in account A of hub
 		// This is a mis config, as you can't have it both ways, local jetstream but default to another one
-		require_NoError(t, ioutil.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
+		require_NoError(t, os.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
 			sHubUpd2.opts.Port,
 			"enabled",
 			jsEnabled,
@@ -1052,7 +1051,7 @@ leafnodes: {
 		require_True(t, err == nats.ErrNoResponders)
 
 		// Add in default domain and restart server
-		require_NoError(t, ioutil.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
+		require_NoError(t, os.WriteFile(confHub, []byte(fmt.Sprintf(tmplHub,
 			sHub.opts.Port, ojwt, syspub, syspub, sysJwt, aPub, aJwt, sHub.opts.LeafNode.Port,
 			fmt.Sprintf(`default_js_domain: {%s:"%s"}`, aPub, domain))), 0664))
 
@@ -1205,4 +1204,85 @@ default_js_domain: {B:"DHUB"}
 	si, err = jsB2.AddStream(&nats.StreamConfig{Name: "bar", Replicas: 1, Subjects: []string{"bar"}})
 	require_NoError(t, err)
 	require_Equal(t, si.Cluster.Name, "HUB")
+}
+
+func TestLeafNodeSvcImportExportCycle(t *testing.T) {
+	accounts := `
+	accounts {
+		SYS: {
+			users: [{user: admin, password: admin}]
+		}
+		LEAF_USER: {
+			users: [{user: leaf_user, password: leaf_user}]
+			imports: [
+				{service: {account: LEAF_INGRESS, subject: "foo"}}
+				{service: {account: LEAF_INGRESS, subject: "_INBOX.>"}}
+				{service: {account: LEAF_INGRESS, subject: "$JS.leaf.API.>"}, to: "JS.leaf_ingress@leaf.API.>" }
+			]
+			jetstream: enabled
+		}
+		LEAF_INGRESS: {
+			users: [{user: leaf_ingress, password: leaf_ingress}]
+			exports: [
+				{service: "foo", accounts: [LEAF_USER]}
+				{service: "_INBOX.>", accounts: [LEAF_USER]}
+				{service: "$JS.leaf.API.>", response_type: "stream", accounts: [LEAF_USER]}
+			]
+			imports: [
+			]
+			jetstream: enabled
+		}
+	}
+	system_account: SYS
+	`
+
+	hconf := createConfFile(t, []byte(fmt.Sprintf(`
+	%s
+	listen: "127.0.0.1:-1"
+	leafnodes {
+		listen: "127.0.0.1:-1"
+	}
+	`, accounts)))
+	defer os.Remove(hconf)
+	s, o := RunServerWithConfig(hconf)
+	defer s.Shutdown()
+
+	lconf := createConfFile(t, []byte(fmt.Sprintf(`
+	%s
+	server_name: leaf-server
+	jetstream {
+		store_dir: '%s'
+		domain=leaf
+	}
+
+	listen: "127.0.0.1:-1"
+	leafnodes {
+		remotes = [
+			{
+				urls: ["nats-leaf://leaf_ingress:leaf_ingress@127.0.0.1:%v"]
+				account: "LEAF_INGRESS"
+			}
+		]
+	}
+	`, accounts, createDir(t, JetStreamStoreDir), o.LeafNode.Port)))
+	defer os.Remove(lconf)
+	sl, so := RunServerWithConfig(lconf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, sl)
+
+	nc := natsConnect(t, fmt.Sprintf("nats://leaf_user:leaf_user@127.0.0.1:%v", so.Port))
+	defer nc.Close()
+
+	js, _ := nc.JetStream(nats.APIPrefix("JS.leaf_ingress@leaf.API."))
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("msg"))
+	require_NoError(t, err)
 }

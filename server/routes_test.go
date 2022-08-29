@@ -1095,7 +1095,7 @@ func TestRouteNoCrashOnAddingSubToRoute(t *testing.T) {
 
 	// Make sure all subs are registered in s.
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
-		if ts := s.globalAccount().TotalSubs() - 3; ts != int(numRoutes) {
+		if ts := s.globalAccount().TotalSubs() - 4; ts != int(numRoutes) {
 			return fmt.Errorf("Not all %d routed subs were registered: %d", numRoutes, ts)
 		}
 		return nil
@@ -1525,4 +1525,68 @@ func TestSubjectRenameViaJetStreamAck(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("Expected error")
 	}
+}
+
+func TestClusterQueueGroupWeightTrackingLeak(t *testing.T) {
+	o := DefaultOptions()
+	o.ServerName = "A"
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.ServerName = "B"
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	// Create a queue subscription
+	sub := natsQueueSubSync(t, nc, "foo", "bar")
+
+	// Check on s0 that we have the proper queue weight info
+	acc := s.GlobalAccount()
+
+	check := func(present bool, expected int32) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			acc.mu.RLock()
+			v, ok := acc.lqws["foo bar"]
+			acc.mu.RUnlock()
+			if present {
+				if !ok {
+					return fmt.Errorf("the key is not present")
+				}
+				if v != expected {
+					return fmt.Errorf("lqws doest not contain expected value of %v: %v", expected, v)
+				}
+			} else if ok {
+				return fmt.Errorf("the key is present with value %v and should not be", v)
+			}
+			return nil
+		})
+	}
+	check(true, 1)
+
+	// Now unsub, and it should be removed, not just be 0
+	sub.Unsubscribe()
+	check(false, 0)
+
+	// Still make sure that the subject interest is gone from both servers.
+	checkSubGone := func(s *Server) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			acc := s.GlobalAccount()
+			acc.mu.RLock()
+			res := acc.sl.Match("foo")
+			acc.mu.RUnlock()
+			if res != nil && len(res.qsubs) > 0 {
+				return fmt.Errorf("Found queue sub on foo for server %v", s)
+			}
+			return nil
+		})
+	}
+	checkSubGone(s)
+	checkSubGone(s2)
 }

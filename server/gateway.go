@@ -118,6 +118,14 @@ func (im GatewayInterestMode) String() string {
 	}
 }
 
+var gwDoNotForceInterestOnlyMode bool
+
+// GatewayDoNotForceInterestOnlyMode is used ONLY in tests.
+// DO NOT USE in normal code or if you embed the NATS Server.
+func GatewayDoNotForceInterestOnlyMode(doNotForce bool) {
+	gwDoNotForceInterestOnlyMode = doNotForce
+}
+
 type srvGateway struct {
 	totalQSubs int64 //total number of queue subs in all remote gateways (used with atomic operations)
 	sync.RWMutex
@@ -156,6 +164,13 @@ type srvGateway struct {
 
 	// This is to track recent subscriptions for a given connection
 	rsubs sync.Map
+	// This client will be used for SYSTEM clients when storing/looking up
+	// recent subscriptions in rsubs. This is because some code may not
+	// use the same actual *client object for SYSTEM client. For instance
+	// a raft node creates an internal client, that would be used to store
+	// the subscription in rsubs, but the sending part that checks for rsubs
+	// is using an internal client created in sendq.go's internalLoop.
+	sysCli *client
 
 	resolver  netResolver   // Used to resolve host name before calling net.Dial()
 	sqbsz     int           // Max buffer size to send queue subs protocol. Used for testing.
@@ -193,16 +208,21 @@ type gatewayCfg struct {
 // Struct for client's gateway related fields
 type gateway struct {
 	name       string
-	outbound   bool
 	cfg        *gatewayCfg
 	connectURL *url.URL          // Needed when sending CONNECT after receiving INFO from remote
 	outsim     *sync.Map         // Per-account subject interest (or no-interest) (outbound conn)
 	insim      map[string]*insie // Per-account subject no-interest sent or modeInterestOnly mode (inbound conn)
 
+	// This is an outbound GW connection
+	outbound bool
 	// Set/check in readLoop without lock. This is to know that an inbound has sent the CONNECT protocol first
 	connected bool
 	// Set to true if outbound is to a server that only knows about $GR, not $GNR
 	useOldPrefix bool
+	// If true, it indicates that the inbound side will switch any account to
+	// interest-only mode "immediately", so the outbound should disregard
+	// the optimistic mode when checking for interest.
+	interestOnlyMode bool
 }
 
 // Outbound subject interest entry.
@@ -346,6 +366,7 @@ func (s *Server) newGateway(opts *Options) error {
 		resolver: opts.Gateway.resolver,
 		runknown: opts.Gateway.RejectUnknown,
 		oldHash:  getOldHash(opts.Gateway.Name),
+		sysCli:   &client{},
 	}
 	gateway.Lock()
 	defer gateway.Unlock()
@@ -510,6 +531,14 @@ func (s *Server) startGatewayAcceptLoop() {
 		GatewayNRP:   true,
 		Headers:      s.supportsHeaders(),
 	}
+	// Unless in some tests we want to keep the old behavior, we are now
+	// (since v2.9.0) indicate that this server will switch all accounts
+	// to InterestOnly mode when accepting an inbound or when a new
+	// account is fetched.
+	if !gwDoNotForceInterestOnlyMode {
+		info.GatewayIOM = true
+	}
+
 	// If we have selected a random port...
 	if port == 0 {
 		// Write resolved port back to options.
@@ -603,7 +632,7 @@ func (g *srvGateway) generateInfoJSON() {
 	// We could be here when processing a route INFO that has a gateway URL,
 	// but this server is not configured for gateways, so simply ignore here.
 	// The configuration mismatch is reported somewhere else.
-	if !g.enabled {
+	if !g.enabled || g.info == nil {
 		return
 	}
 	g.info.GatewayURLs = g.URLs.getAsStringSlice()
@@ -1038,6 +1067,7 @@ func (c *client) processGatewayInfo(info *Info) {
 			// from this INFO protocol and can sign it in the CONNECT we are
 			// going to send now.
 			c.mu.Lock()
+			c.gw.interestOnlyMode = info.GatewayIOM
 			c.sendGatewayConnect(opts)
 			c.Debugf("Gateway connect protocol sent to %q", gwName)
 			// Send INFO too
@@ -1122,8 +1152,9 @@ func (c *client) processGatewayInfo(info *Info) {
 		js := s.js
 		s.mu.Unlock()
 
-		// Switch JetStream accounts to interest-only mode.
-		if js != nil {
+		// If running in some tests, maintain the original behavior.
+		if gwDoNotForceInterestOnlyMode && js != nil {
+			// Switch JetStream accounts to interest-only mode.
 			var accounts []string
 			js.mu.Lock()
 			if len(js.accounts) > 0 {
@@ -1140,6 +1171,15 @@ func (c *client) processGatewayInfo(info *Info) {
 					}
 				}
 			}
+		} else if !gwDoNotForceInterestOnlyMode {
+			// Starting 2.9.0, we are phasing out the optimistic mode, so change
+			// all accounts to interest-only mode, unless instructed not to do so
+			// in some tests.
+			s.accounts.Range(func(_, v interface{}) bool {
+				acc := v.(*Account)
+				s.switchAccountToInterestMode(acc.GetName())
+				return true
+			})
 		}
 	}
 }
@@ -2050,17 +2090,19 @@ func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult) {
 	if accountInMap && ei == nil {
 		return false, nil
 	}
-	// Assume interest if account not in map.
-	psi := !accountInMap
+	// Assume interest if account not in map, unless we support
+	// only interest-only mode.
+	psi := !accountInMap && !c.gw.interestOnlyMode
 	var r *SublistResult
 	if accountInMap {
 		// If in map, check for subs interest with sublist.
 		e := ei.(*outsie)
 		e.RLock()
-		// We may be in transition to modeInterestOnly
+		// Unless each side has agreed on interest-only mode,
+		// we may be in transition to modeInterestOnly
 		// but until e.ni is nil, use it to know if we
 		// should suppress interest or not.
-		if e.ni != nil {
+		if !c.gw.interestOnlyMode && e.ni != nil {
 			if _, inMap := e.ni[subj]; !inMap {
 				psi = true
 			}
@@ -2326,6 +2368,9 @@ func (s *Server) gatewayUpdateSubInterest(accName string, sub *subscription, cha
 	if sub.client != nil {
 		rsubs := &s.gateway.rsubs
 		c := sub.client
+		if c.kind == SYSTEM {
+			c = s.gateway.sysCli
+		}
 		sli, _ := rsubs.Load(c)
 		if change > 0 {
 			var sl *Sublist
@@ -2391,6 +2436,8 @@ func (g *srvGateway) shouldMapReplyForGatewaySend(c *client, acc *Account, reply
 		acc.mu.Lock()
 		c = acc.internalClient()
 		acc.mu.Unlock()
+	} else if c.kind == SYSTEM {
+		c = g.sysCli
 	}
 	// If for this client there is a recent matching subscription interest
 	// then we will map.
@@ -3096,7 +3143,7 @@ func (c *client) gatewaySwitchAccountToSendAllSubs(e *insie, accName string) {
 // If `client` is nil, the mapping is stored in the client's account's gwReplyMapping
 // structure. Account lock will be explicitly acquired.
 // This is a server receiver because we use a timer interval that is avail in
-/// Server.gateway object.
+// Server.gateway object.
 func (s *Server) trackGWReply(c *client, acc *Account, reply, routedReply []byte) {
 	var l sync.Locker
 	var g *gwReplyMapping

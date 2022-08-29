@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -3017,7 +3018,7 @@ func TestMQTTClusterReplicasCount(t *testing.T) {
 				s = cl.randomServer()
 			}
 
-			mc, rc := testMQTTConnect(t, &mqttConnInfo{clientID: "sub", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+			mc, rc := testMQTTConnectRetry(t, &mqttConnInfo{clientID: "sub", cleanSess: false}, o.MQTT.Host, o.MQTT.Port, 5)
 			defer mc.Close()
 			testMQTTCheckConnAck(t, rc, mqttConnAckRCConnectionAccepted, false)
 			testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/#", qos: 1}}, []byte{1})
@@ -3167,8 +3168,10 @@ func TestMQTTLeafnodeWithoutJSToClusterWithJSNoSharedSysAcc(t *testing.T) {
 			for _, s := range cluster {
 				if s.JetStreamIsLeader() {
 					// Need to wait for usage updates now to propagate to meta leader.
-					time.Sleep(250 * time.Millisecond)
-					return nil
+					if len(s.JetStreamClusterPeers()) == len(cluster) {
+						time.Sleep(100 * time.Millisecond)
+						return nil
+					}
 				}
 			}
 			return fmt.Errorf("no leader yet")
@@ -4359,8 +4362,22 @@ func TestMQTTFlappingSession(t *testing.T) {
 	defer c.Close()
 	proto := mqttCreateConnectProto(ci)
 	if _, err := testMQTTWrite(c, proto); err != nil {
-		t.Fatalf("Error writing connect: %v", err)
+		t.Fatalf("Error writing protocols: %v", err)
 	}
+	// Misbehave and send a SUB protocol without waiting for the CONNACK
+	w := &mqttWriter{}
+	pkLen := 2 // for pi
+	// Topic "foo"
+	pkLen += 2 + 3 + 1
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(pkLen)
+	w.WriteUint16(1)
+	w.WriteBytes([]byte("foo"))
+	w.WriteByte(1)
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing protocols: %v", err)
+	}
+	// Now read the CONNACK and we should have been disconnected.
 	if _, err := testMQTTRead(c); err == nil {
 		t.Fatal("Expected connection to fail")
 	}
@@ -5737,8 +5754,8 @@ func TestMQTTStreamReplicasInsufficientResources(t *testing.T) {
 
 	select {
 	case e := <-l.errCh:
-		if !strings.Contains(e, NewJSInsufficientResourcesError().Description) {
-			t.Fatalf("Expected error regarding insufficient resources, got %v", e)
+		if !strings.Contains(e, fmt.Sprintf("%d", NewJSClusterNoPeersError(errors.New("")).ErrCode)) {
+			t.Fatalf("Expected error regarding no peers error, got %v", e)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("Did not get the error regarding replicas count")
@@ -5927,7 +5944,7 @@ func TestMQTTConsumerReplicasExceedsParentStream(t *testing.T) {
 	}
 
 	o := cl.opts[0]
-	mc, r := testMQTTConnect(t, &mqttConnInfo{clientID: "test", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	mc, r := testMQTTConnectRetry(t, &mqttConnInfo{clientID: "test", cleanSess: false}, o.MQTT.Host, o.MQTT.Port, 2)
 	defer mc.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 	testMQTTSub(t, 1, mc, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{mqttSubAckFailure})
@@ -5971,7 +5988,7 @@ func TestMQTTSessionNotDeletedOnDeleteConsumerError(t *testing.T) {
 	nc, js := jsClientConnect(t, s1)
 	defer nc.Close()
 
-	mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	mc, r := testMQTTConnectRetry(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port, 5)
 	defer mc.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 

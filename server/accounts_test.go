@@ -16,6 +16,7 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -49,47 +50,54 @@ func simpleAccountServer(t *testing.T) (*Server, *Account, *Account) {
 
 func TestPlaceHolderIndex(t *testing.T) {
 	testString := "$1"
-	indexes, nbPartitions, err := placeHolderIndex(testString)
+	transformType, indexes, nbPartitions, _, err := indexPlaceHolders(testString)
+	var position int32
 
-	if err != nil || len(indexes) != 1 || indexes[0] != 1 || nbPartitions != -1 {
+	if err != nil || transformType != Wildcard || len(indexes) != 1 || indexes[0] != 1 || nbPartitions != -1 {
 		t.Fatalf("Error parsing %s", testString)
 	}
 
 	testString = "{{partition(10,1,2,3)}}"
 
-	indexes, nbPartitions, err = placeHolderIndex(testString)
+	transformType, indexes, nbPartitions, _, err = indexPlaceHolders(testString)
 
-	if err != nil || !reflect.DeepEqual(indexes, []int{1, 2, 3}) || nbPartitions != 10 {
+	if err != nil || transformType != Partition || !reflect.DeepEqual(indexes, []int{1, 2, 3}) || nbPartitions != 10 {
 		t.Fatalf("Error parsing %s", testString)
 	}
 
-	testString = "{{ partition(10,1,2,3) }}"
+	testString = "{{ Partition (10,1,2,3) }}"
 
-	indexes, nbPartitions, err = placeHolderIndex(testString)
+	transformType, indexes, nbPartitions, _, err = indexPlaceHolders(testString)
 
-	if err != nil || !reflect.DeepEqual(indexes, []int{1, 2, 3}) || nbPartitions != 10 {
-		t.Fatalf("Error parsing %s", testString)
-	}
-
-	testString = "{{partition (10,1,2,3)}}"
-
-	indexes, nbPartitions, err = placeHolderIndex(testString)
-
-	if err != nil || !reflect.DeepEqual(indexes, []int{1, 2, 3}) || nbPartitions != 10 {
+	if err != nil || transformType != Partition || !reflect.DeepEqual(indexes, []int{1, 2, 3}) || nbPartitions != 10 {
 		t.Fatalf("Error parsing %s", testString)
 	}
 
 	testString = "{{wildcard(2)}}"
-	indexes, nbPartitions, err = placeHolderIndex(testString)
+	transformType, indexes, nbPartitions, _, err = indexPlaceHolders(testString)
 
-	if err != nil || len(indexes) != 1 || indexes[0] != 2 || nbPartitions != -1 {
+	if err != nil || transformType != Wildcard || len(indexes) != 1 || indexes[0] != 2 || nbPartitions != -1 {
 		t.Fatalf("Error parsing %s", testString)
 	}
 
-	testString = "{{ wildcard (2) }}"
-	indexes, nbPartitions, err = placeHolderIndex(testString)
+	testString = "{{SplitFromLeft(2,1)}}"
+	transformType, indexes, position, _, err = indexPlaceHolders(testString)
 
-	if err != nil || len(indexes) != 1 || indexes[0] != 2 || nbPartitions != -1 {
+	if err != nil || transformType != SplitFromLeft || len(indexes) != 1 || indexes[0] != 2 || position != 1 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{SplitFromRight(3,2)}}"
+	transformType, indexes, position, _, err = indexPlaceHolders(testString)
+
+	if err != nil || transformType != SplitFromRight || len(indexes) != 1 || indexes[0] != 3 || position != 2 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{SliceFromLeft(2,2)}}"
+	transformType, indexes, sliceSize, _, err := indexPlaceHolders(testString)
+
+	if err != nil || transformType != SliceFromLeft || len(indexes) != 1 || indexes[0] != 2 || sliceSize != 2 {
 		t.Fatalf("Error parsing %s", testString)
 	}
 }
@@ -3262,10 +3270,12 @@ func TestSamplingHeader(t *testing.T) {
 func TestSubjectTransforms(t *testing.T) {
 	shouldErr := func(src, dest string) {
 		t.Helper()
-		if _, err := newTransform(src, dest); err != ErrBadSubject && err != ErrBadSubjectMappingDestination {
+		if _, err := newTransform(src, dest); err != ErrBadSubject && !errors.Is(err, ErrInvalidMappingDestination) {
 			t.Fatalf("Did not get an error for src=%q and dest=%q", src, dest)
 		}
 	}
+
+	shouldErr("foo.*.*", "bar.$2") // Must place all pwcs.
 
 	// Must be valid subjects.
 	shouldErr("foo", "")
@@ -3275,10 +3285,19 @@ func TestSubjectTransforms(t *testing.T) {
 	// e.g. foo.* -> bar.$1.
 	// Need to have as many pwcs as placements on other side.
 	shouldErr("foo.*", "bar.*")
-	shouldErr("foo.*", "bar.$2")   // Bad pwc token identifier
-	shouldErr("foo.*", "bar.$1.>") // fwcs have to match.
-	shouldErr("foo.>", "bar.baz")  // fwcs have to match.
-	shouldErr("foo.*.*", "bar.$2") // Must place all pwcs.
+	shouldErr("foo.*", "bar.$2")                   // Bad pwc token identifier
+	shouldErr("foo.*", "bar.$1.>")                 // fwcs have to match.
+	shouldErr("foo.>", "bar.baz")                  // fwcs have to match.
+	shouldErr("foo.*.*", "bar.$2")                 // Must place all pwcs.
+	shouldErr("foo.*", "foo.$foo")                 // invalid $ value
+	shouldErr("foo.*", "foo.{{wildcard(2)}}")      // Mapping function being passed an out of range wildcard index
+	shouldErr("foo.*", "foo.{{unimplemented(1)}}") // Mapping trying to use an unknown mapping function
+	shouldErr("foo.*", "foo.{{partition(10)}}")    // Not enough arguments passed to the mapping function
+	shouldErr("foo.*", "foo.{{wildcard(foo)}}")    // Invalid argument passed to the mapping function
+	shouldErr("foo.*", "foo.{{wildcard()}}")       // Not enough arguments passed to the mapping function
+	shouldErr("foo.*", "foo.{{wildcard(1,2)}}")    // Too many arguments passed to the mapping function
+	shouldErr("foo.*", "foo.{{ wildcard5) }}")     // Bad mapping function
+	shouldErr("foo.*", "foo.{{splitLeft(2,2}}")    // arg out of range
 
 	shouldBeOK := func(src, dest string) *transform {
 		t.Helper()
@@ -3292,6 +3311,7 @@ func TestSubjectTransforms(t *testing.T) {
 	shouldBeOK("foo", "bar")
 	shouldBeOK("foo.*.bar.*.baz", "req.$2.$1")
 	shouldBeOK("baz.>", "mybaz.>")
+	shouldBeOK("*", "{{splitfromleft(1,1)}}")
 
 	shouldMatch := func(src, dest, sample, expected string) {
 		t.Helper()
@@ -3310,6 +3330,12 @@ func TestSubjectTransforms(t *testing.T) {
 	shouldMatch("baz.>", "my.pre.>", "baz.1.2.3", "my.pre.1.2.3")
 	shouldMatch("baz.>", "foo.bar.>", "baz.1.2.3", "foo.bar.1.2.3")
 	shouldMatch("*", "foo.bar.$1", "foo", "foo.bar.foo")
+	shouldMatch("*", "{{splitfromleft(1,3)}}", "12345", "123.45")
+	shouldMatch("*", "{{SplitFromRight(1,3)}}", "12345", "12.345")
+	shouldMatch("*", "{{SliceFromLeft(1,3)}}", "1234567890", "123.456.789.0")
+	shouldMatch("*", "{{SliceFromRight(1,3)}}", "1234567890", "1.234.567.890")
+	shouldMatch("*", "{{split(1,-)}}", "-abc-def--ghi-", "abc.def.ghi")
+	shouldMatch("*.*", "{{split(2,-)}}.{{splitfromleft(1,2)}}", "foo.-abc-def--ghij-", "abc.def.ghij.fo.o") // combo + checks split for multiple instance of deliminator and deliminator being at the start or end
 }
 
 func TestAccountSystemPermsWithGlobalAccess(t *testing.T) {
@@ -3497,4 +3523,65 @@ func TestAccountUserSubPermsWithQueueGroups(t *testing.T) {
 
 	// Expect no msgs.
 	checkSubsPending(t, qsub, 0)
+}
+
+func TestAccountImportCycle(t *testing.T) {
+	tmpl := `
+	port: -1
+	accounts: {
+		CP: {
+			users: [
+				{user: cp, password: cp},
+			],
+			exports: [
+				{service: "q1.>", response_type: Singleton},
+				{service: "q2.>", response_type: Singleton},
+				%s
+			],
+		},
+		A: {
+			users: [
+				{user: a, password: a},
+			],
+			imports: [
+				{service: {account: CP, subject: "q1.>"}},
+				{service: {account: CP, subject: "q2.>"}},
+				%s
+			]
+		},
+	}
+	`
+	cf := createConfFile(t, []byte(fmt.Sprintf(tmpl, _EMPTY_, _EMPTY_)))
+	defer removeFile(t, cf)
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+	ncCp, err := nats.Connect(s.ClientURL(), nats.UserInfo("cp", "cp"))
+	require_NoError(t, err)
+	defer ncCp.Close()
+	ncA, err := nats.Connect(s.ClientURL(), nats.UserInfo("a", "a"))
+	require_NoError(t, err)
+	defer ncA.Close()
+	// setup responder
+	natsSub(t, ncCp, "q1.>", func(m *nats.Msg) { m.Respond([]byte("reply")) })
+	// setup requestor
+	ib := "q2.inbox"
+	subAResp, err := ncA.SubscribeSync(ib)
+	require_NoError(t, err)
+	req := func() {
+		t.Helper()
+		// send request
+		err = ncA.PublishRequest("q1.a", ib, []byte("test"))
+		require_NoError(t, err)
+		mRep, err := subAResp.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_Equal(t, string(mRep.Data), "reply")
+	}
+	req()
+
+	// Update the config and do a config reload and make sure it all still work
+	changeCurrentConfigContentWithNewContent(t, cf, []byte(
+		fmt.Sprintf(tmpl, `{service: "q3.>", response_type: Singleton},`, `{service: {account: CP, subject: "q3.>"}},`)))
+	err = s.Reload()
+	require_NoError(t, err)
+	req()
 }

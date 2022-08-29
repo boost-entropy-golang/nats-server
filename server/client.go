@@ -110,6 +110,9 @@ const (
 	// For stalling fast producers
 	stallClientMinDuration = 100 * time.Millisecond
 	stallClientMaxDuration = time.Second
+
+	// Threshold for not knowingly doing a potential blocking operation when internal and on a route or gateway or leafnode.
+	noBlockThresh = 500 * time.Millisecond
 )
 
 var readLoopReportThreshold = readLoopReport
@@ -203,6 +206,7 @@ const (
 	DuplicateClientID
 	DuplicateServerName
 	MinimumVersionRequired
+	ClusterNamesIdentical
 )
 
 // Some flags passed to processMsgResults
@@ -357,6 +361,7 @@ type readCacheFlag uint16
 
 const (
 	hasMappings readCacheFlag = 1 << iota // For account subject mappings.
+	sysGroup                  = "_sys_"
 )
 
 // Used in readloop to cache hot subject lookups and group statistics.
@@ -384,6 +389,9 @@ type readCache struct {
 
 	// These are for readcache flags to avoind locks.
 	flags readCacheFlag
+
+	// Capture the time we started processing our readLoop.
+	start time.Time
 }
 
 // set the flag (would be equivalent to set the boolean to true)
@@ -1206,7 +1214,6 @@ func (c *client) readLoop(pre []byte) {
 		} else {
 			bufs[0] = b[:n]
 		}
-		start := time.Now()
 
 		// Check if the account has mappings and if so set the local readcache flag.
 		// We check here to make sure any changes such as config reload are reflected here.
@@ -1217,6 +1224,8 @@ func (c *client) readLoop(pre []byte) {
 				c.in.flags.clear(hasMappings)
 			}
 		}
+
+		c.in.start = time.Now()
 
 		// Clear inbound stats cache
 		c.in.msgs = 0
@@ -1236,7 +1245,7 @@ func (c *client) readLoop(pre []byte) {
 					// We don't need to do any of the things below, simply return.
 					return
 				}
-				if dur := time.Since(start); dur >= readLoopReportThreshold {
+				if dur := time.Since(c.in.start); dur >= readLoopReportThreshold {
 					c.Warnf("Readloop processing time: %v", dur)
 				}
 				// Need to call flushClients because some of the clients have been
@@ -1257,6 +1266,10 @@ func (c *client) readLoop(pre []byte) {
 		if c.in.msgs > 0 {
 			atomic.AddInt64(&c.inMsgs, int64(c.in.msgs))
 			atomic.AddInt64(&c.inBytes, int64(c.in.bytes))
+			if acc != nil {
+				atomic.AddInt64(&acc.inMsgs, int64(c.in.msgs))
+				atomic.AddInt64(&acc.inBytes, int64(c.in.bytes))
+			}
 			atomic.AddInt64(&s.inMsgs, int64(c.in.msgs))
 			atomic.AddInt64(&s.inBytes, int64(c.in.bytes))
 		}
@@ -1299,7 +1312,7 @@ func (c *client) readLoop(pre []byte) {
 			return
 		}
 
-		if dur := time.Since(start); dur >= readLoopReportThreshold {
+		if dur := time.Since(c.in.start); dur >= readLoopReportThreshold {
 			c.Warnf("Readloop processing time: %v", dur)
 		}
 
@@ -1310,7 +1323,7 @@ func (c *client) readLoop(pre []byte) {
 			return
 		}
 
-		if cpacc && (start.Sub(lpacc)) >= closedSubsCheckInterval {
+		if cpacc && (c.in.start.Sub(lpacc)) >= closedSubsCheckInterval {
 			c.pruneClosedSubFromPerAccountCache()
 			lpacc = time.Now()
 		}
@@ -1518,6 +1531,9 @@ func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) boo
 
 	// Slow consumer here..
 	atomic.AddInt64(&c.srv.slowConsumers, 1)
+	if c.acc != nil {
+		atomic.AddInt64(&c.acc.slowConsumers, 1)
+	}
 	c.Noticef("Slow Consumer Detected: WriteDeadline of %v exceeded with %d chunks of %d total bytes.",
 		c.out.wdl, numChunks, attempted)
 
@@ -1980,6 +1996,9 @@ func (c *client) queueOutbound(data []byte) {
 		// checking current pb+len(data) and then add to pb.
 		c.out.pb -= int64(len(data))
 		atomic.AddInt64(&c.srv.slowConsumers, 1)
+		if c.acc != nil {
+			atomic.AddInt64(&c.acc.slowConsumers, 1)
+		}
 		c.Noticef("Slow Consumer Detected: MaxPending of %d Exceeded", c.out.mp)
 		c.markConnAsClosed(SlowConsumerPendingBytes)
 		return
@@ -2441,7 +2460,7 @@ func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForw
 		// allow = ["foo", "foo v1"]  -> can subscribe to 'foo' but can only queue subscribe to 'foo v1'
 		//
 		if sub.queue != nil {
-			if !c.canSubscribe(string(sub.subject), string(sub.queue)) {
+			if !c.canSubscribe(string(sub.subject), string(sub.queue)) || string(sub.queue) == sysGroup {
 				c.mu.Unlock()
 				c.subPermissionViolation(sub)
 				return nil, ErrSubscribePermissionViolation
@@ -3178,6 +3197,10 @@ func (c *client) deliverMsg(sub *subscription, acc *Account, subject, reply, mh,
 	}
 
 	// We don't count internal deliveries so we update server statistics here.
+	if acc != nil {
+		atomic.AddInt64(&acc.outMsgs, 1)
+		atomic.AddInt64(&acc.outBytes, msgSize)
+	}
 	atomic.AddInt64(&srv.outMsgs, 1)
 	atomic.AddInt64(&srv.outBytes, msgSize)
 
@@ -3835,25 +3858,30 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	}
 	// If we are here and we are a serviceImport response make sure we are not matching back
 	// to the import/export pair that started the request. If so ignore.
-	if isResponse && c.pa.psi != nil && c.pa.psi.se == si.se {
-		return
+	if isResponse && len(c.pa.psi) > 0 {
+		for i := len(c.pa.psi) - 1; i >= 0; i-- {
+			if psi := c.pa.psi[i]; psi.se == si.se {
+				return
+			}
+		}
 	}
 
 	acc.mu.RLock()
+	var checkJS bool
 	shouldReturn := si.invalid || acc.sl == nil
-	checkJSGetNext := !isResponse && si.to == jsAllAPI && strings.HasPrefix(string(c.pa.subject), jsRequestNextPre)
+	if !shouldReturn && !isResponse && si.to == jsAllAPI {
+		subj := string(c.pa.subject)
+		if strings.HasPrefix(subj, jsRequestNextPre) || strings.HasPrefix(subj, jsDirectGetPre) {
+			checkJS = true
+		}
+	}
 	acc.mu.RUnlock()
 
 	// We have a special case where JetStream pulls in all service imports through one export.
-	// However the GetNext for consumers is a no-op and causes buildups of service imports,
+	// However the GetNext for consumers and DirectGet for streams are a no-op and causes buildups of service imports,
 	// response service imports and rrMap entries which all will need to simply expire.
 	// TODO(dlc) - Come up with something better.
-	if checkJSGetNext && si.se != nil && si.se.acc == c.srv.SystemAccount() {
-		shouldReturn = true
-	}
-
-	// Check for short circuit return.
-	if shouldReturn {
+	if shouldReturn || (checkJS && si.se != nil && si.se.acc == c.srv.SystemAccount()) {
 		return
 	}
 
@@ -3911,15 +3939,17 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	}
 
 	// Set previous service import to detect chaining.
-	hadPrevSi, share := c.pa.psi != nil, si.share
+	lpsi := len(c.pa.psi)
+	hadPrevSi, share := lpsi > 0, si.share
 	if hadPrevSi {
-		share = c.pa.psi.share
+		share = c.pa.psi[lpsi-1].share
 	}
-	c.pa.psi = si
+	c.pa.psi = append(c.pa.psi, si)
 
 	// Place our client info for the request in the original message.
 	// This will survive going across routes, etc.
 	if !isResponse {
+		isSysImport := si.acc == c.srv.SystemAccount()
 		var ci *ClientInfo
 		if hadPrevSi && c.pa.hdr >= 0 {
 			var cis ClientInfo
@@ -3928,15 +3958,22 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 				ci.Service = acc.Name
 				// Check if we are moving into a share details account from a non-shared
 				// and add in server and cluster details.
-				if !share && si.share {
+				if !share && (si.share || isSysImport) {
 					c.addServerAndClusterInfo(ci)
 				}
 			}
 		} else if c.kind != LEAF || c.pa.hdr < 0 || len(getHeader(ClientInfoHdr, msg[:c.pa.hdr])) == 0 {
 			ci = c.getClientInfo(share)
-		} else if c.kind == LEAF && si.share {
+			// If we did not share but the imports destination is the system account add in the server and cluster info.
+			if !share && isSysImport {
+				c.addServerAndClusterInfo(ci)
+			}
+		} else if c.kind == LEAF && (si.share || isSysImport) {
 			// We have a leaf header here for ci, augment as above.
 			ci = c.getClientInfo(si.share)
+			if !si.share && isSysImport {
+				c.addServerAndClusterInfo(ci)
+			}
 		}
 		// Set clientInfo if present.
 		if ci != nil {

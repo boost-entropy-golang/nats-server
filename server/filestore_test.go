@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/bits"
 	"math/rand"
 	"os"
@@ -786,7 +785,20 @@ func TestFileStoreCompact(t *testing.T) {
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	prf := func(context []byte) ([]byte, error) {
+		h := hmac.New(sha256.New, []byte("dlc22"))
+		if _, err := h.Write(context); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+
+	fs, err := newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 350},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+		time.Now(),
+		prf,
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -821,6 +833,22 @@ func TestFileStoreCompact(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("Expected to have purged 5 msgs, got %d", n)
 	}
+	if state = fs.State(); state.FirstSeq != 100 {
+		t.Fatalf("Expected first seq of 100, got %d", state.FirstSeq)
+	}
+
+	fs.Stop()
+	fs, err = newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 350},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+		time.Now(),
+		prf,
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
 	if state = fs.State(); state.FirstSeq != 100 {
 		t.Fatalf("Expected first seq of 100, got %d", state.FirstSeq)
 	}
@@ -942,9 +970,19 @@ func TestFileStoreStreamTruncate(t *testing.T) {
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
 
-	fs, err := newFileStore(
+	prf := func(context []byte) ([]byte, error) {
+		h := hmac.New(sha256.New, []byte("dlc22"))
+		if _, err := h.Write(context); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+
+	fs, err := newFileStoreWithCreated(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: 350},
-		StreamConfig{Name: "zzz", Storage: FileStorage},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+		time.Now(),
+		prf,
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -996,7 +1034,13 @@ func TestFileStoreStreamTruncate(t *testing.T) {
 
 	// Make sure we can recover same state.
 	fs.Stop()
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+
+	fs, err = newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 350},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+		time.Now(),
+		prf,
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1005,13 +1049,20 @@ func TestFileStoreStreamTruncate(t *testing.T) {
 	if state := fs.State(); !reflect.DeepEqual(state, before) {
 		t.Fatalf("Expected state of %+v, got %+v", before, state)
 	}
+
+	mb := fs.getFirstBlock()
+	require_True(t, mb != nil)
+	require_NoError(t, mb.loadMsgs())
 }
 
 func TestFileStoreRemovePartialRecovery(t *testing.T) {
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1040,7 +1091,10 @@ func TestFileStoreRemovePartialRecovery(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, err = newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1056,7 +1110,10 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1097,7 +1154,10 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, err = newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1194,7 +1254,7 @@ func TestFileStoreBitRot(t *testing.T) {
 		// Now twiddle some bits.
 		fs.mu.Lock()
 		lmb := fs.lmb
-		contents, _ := ioutil.ReadFile(lmb.mfn)
+		contents, _ := os.ReadFile(lmb.mfn)
 		var index int
 		for {
 			index = rand.Intn(len(contents))
@@ -1205,7 +1265,7 @@ func TestFileStoreBitRot(t *testing.T) {
 				break
 			}
 		}
-		ioutil.WriteFile(lmb.mfn, contents, 0644)
+		os.WriteFile(lmb.mfn, contents, 0644)
 		fs.mu.Unlock()
 
 		ld := fs.checkMsgs()
@@ -1373,7 +1433,7 @@ func TestFileStoreMeta(t *testing.T) {
 		t.Fatalf("Expected metafile's checksum %q to exist", metasum)
 	}
 
-	buf, err := ioutil.ReadFile(metafile)
+	buf, err := os.ReadFile(metafile)
 	if err != nil {
 		t.Fatalf("Error reading metafile: %v", err)
 	}
@@ -1384,7 +1444,7 @@ func TestFileStoreMeta(t *testing.T) {
 	if !reflect.DeepEqual(mconfig, mconfig2) {
 		t.Fatalf("Stream configs not equal, got %+v vs %+v", mconfig2, mconfig)
 	}
-	checksum, err := ioutil.ReadFile(metasum)
+	checksum, err := os.ReadFile(metasum)
 	if err != nil {
 		t.Fatalf("Error reading metafile checksum: %v", err)
 	}
@@ -1418,7 +1478,7 @@ func TestFileStoreMeta(t *testing.T) {
 		t.Fatalf("Expected consumer metafile's checksum %q to exist", ometasum)
 	}
 
-	buf, err = ioutil.ReadFile(ometafile)
+	buf, err = os.ReadFile(ometafile)
 	if err != nil {
 		t.Fatalf("Error reading consumer metafile: %v", err)
 	}
@@ -1430,7 +1490,7 @@ func TestFileStoreMeta(t *testing.T) {
 	if !reflect.DeepEqual(oconfig2, oconfig) {
 		t.Fatalf("Consumer configs not equal, got %+v vs %+v", oconfig2, oconfig)
 	}
-	checksum, err = ioutil.ReadFile(ometasum)
+	checksum, err = os.ReadFile(ometasum)
 
 	if err != nil {
 		t.Fatalf("Error reading consumer metafile checksum: %v", err)
@@ -1686,7 +1746,7 @@ func TestFileStorePartialIndexes(t *testing.T) {
 
 	// Force idx to expire by resetting last remove ts.
 	mb.mu.Lock()
-	mb.lrts = mb.lrts - int64(defaultCacheIdxExpiration*2)
+	mb.llts = mb.llts - int64(defaultCacheBufferExpiration*2)
 	mb.mu.Unlock()
 
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
@@ -1717,7 +1777,7 @@ func TestFileStoreSnapshot(t *testing.T) {
 
 	fs, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
-		StreamConfig{Name: "zzz", Storage: FileStorage},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
 	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -1760,7 +1820,7 @@ func TestFileStoreSnapshot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error creating snapshot")
 		}
-		snapshot, err := ioutil.ReadAll(r.Reader)
+		snapshot, err := io.ReadAll(r.Reader)
 		if err != nil {
 			t.Fatalf("Error reading snapshot")
 		}
@@ -1800,7 +1860,7 @@ func TestFileStoreSnapshot(t *testing.T) {
 
 		fsr, err := newFileStore(
 			FileStoreConfig{StoreDir: rstoreDir},
-			StreamConfig{Name: "zzz", Storage: FileStorage},
+			StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
 		)
 		if err != nil {
 			t.Fatalf("Error restoring from snapshot: %v", err)
@@ -2795,7 +2855,7 @@ func TestFileStoreStreamDeleteDirNotEmpty(t *testing.T) {
 		g := filepath.Join(storeDir, "g")
 		ready <- true
 		for i := 0; i < 100; i++ {
-			ioutil.WriteFile(g, []byte("OK"), defaultFilePerms)
+			os.WriteFile(g, []byte("OK"), defaultFilePerms)
 		}
 	}()
 
@@ -2880,7 +2940,7 @@ func TestFileStoreStreamIndexBug(t *testing.T) {
 	dir := createDir(t, "js-bad-idx-")
 	defer removeDir(t, dir)
 	fn := filepath.Join(dir, "1.idx")
-	ioutil.WriteFile(fn, badIdxBytes, 0644)
+	os.WriteFile(fn, badIdxBytes, 0644)
 	mb := &msgBlock{index: 1, ifn: fn}
 	if err := mb.readIndexInfo(); err == nil || !strings.Contains(err.Error(), "short index") {
 		t.Fatalf("Expected error during readIndexInfo(): %v", err)
@@ -3000,7 +3060,7 @@ func TestFileStoreStreamFailToRollBug(t *testing.T) {
 	// Grab some info for introspection.
 	fs.mu.RLock()
 	numBlks := len(fs.blks)
-	var index uint64
+	var index uint32
 	var blkSize int64
 	if numBlks > 0 {
 		mb := fs.blks[0]
@@ -3102,6 +3162,7 @@ func TestFileStoreExpireMsgsOnStart(t *testing.T) {
 	}
 
 	checkNumBlks := func(expected int) {
+		t.Helper()
 		fs.mu.RLock()
 		n := len(fs.blks)
 		fs.mu.RUnlock()
@@ -3174,7 +3235,8 @@ func TestFileStoreExpireMsgsOnStart(t *testing.T) {
 	loadMsgs(500)
 	restartFS(ttl + 100*time.Millisecond)
 	checkState(0, 501, 500)
-	checkNumBlks(0)
+	// We actually hold onto the last one now to remember our starting sequence.
+	checkNumBlks(1)
 
 	// Now check partial expires and the fss tracking state.
 	// Small numbers is to keep them in one block.
@@ -3182,6 +3244,8 @@ func TestFileStoreExpireMsgsOnStart(t *testing.T) {
 	loadMsgs(10)
 	time.Sleep(100 * time.Millisecond)
 	loadMsgs(10)
+	checkFiltered("orders.*", SimpleState{Msgs: 20, First: 1, Last: 20})
+
 	restartFS(ttl - 100*time.Millisecond + 25*time.Millisecond) // Just want half
 	checkState(10, 11, 20)
 	checkNumBlks(1)
@@ -3893,7 +3957,7 @@ func TestFileStorePurgeExWithSubject(t *testing.T) {
 	defer removeDir(t, storeDir)
 
 	fs, err := newFileStore(
-		FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "TEST", Storage: FileStorage},
+		FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: FileStorage},
 	)
 	require_NoError(t, err)
 	defer fs.Stop()
@@ -3906,4 +3970,543 @@ func TestFileStorePurgeExWithSubject(t *testing.T) {
 	// This should purge all.
 	fs.PurgeEx("foo", 1, 0)
 	require_True(t, fs.State().Msgs == 0)
+}
+
+// When the N.idx file is shorter than the previous write we could fail to recover the idx properly.
+// For instance, with encryption and an expiring stream that has no messages, when a restart happens the decrypt will fail
+// since their are extra bytes, and this could lead to a stream sequence reset to zero.
+func TestFileStoreShortIndexWriteBug(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	// Encrypted mode shows, but could effect non-encrypted mode.
+	prf := func(context []byte) ([]byte, error) {
+		h := hmac.New(sha256.New, []byte("offby1"))
+		if _, err := h.Write(context); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+
+	created := time.Now()
+
+	fs, err := newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "TEST", Storage: FileStorage, MaxAge: time.Second},
+		created,
+		prf,
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	for i := 0; i < 100; i++ {
+		_, _, err = fs.StoreMsg("foo", nil, nil)
+		require_NoError(t, err)
+	}
+	// Wait til messages all go away.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if state := fs.State(); state.Msgs != 0 {
+			return fmt.Errorf("Expected no msgs, got %d", state.Msgs)
+		}
+		return nil
+	})
+
+	if state := fs.State(); state.FirstSeq != 101 {
+		t.Fatalf("Expected first sequence of 101 vs %d", state.FirstSeq)
+	}
+
+	// I noticed that we also would dangle an open ifd when we did closeAndKeepIndex(), check that we do not anymore.
+	fs.mu.RLock()
+	mb := fs.lmb
+	mb.mu.RLock()
+	hasIfd := mb.ifd != nil
+	mb.mu.RUnlock()
+	fs.mu.RUnlock()
+	require_False(t, hasIfd)
+
+	// Now restart..
+	fs.Stop()
+	fs, err = newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "TEST", Storage: FileStorage, MaxAge: time.Second},
+		created,
+		prf,
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	if state := fs.State(); state.FirstSeq != 101 || state.LastSeq != 100 {
+		t.Fatalf("Expected first sequence of 101 vs %d", state.FirstSeq)
+	}
+}
+
+func TestFileStoreDoubleCompactWithWriteInBetweenEncryptedBug(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(storeDir)
+
+	prf := func(context []byte) ([]byte, error) {
+		h := hmac.New(sha256.New, []byte("dlc22"))
+		if _, err := h.Write(context); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+
+	fs, err := newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+		time.Now(),
+		prf,
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	subj, msg := "foo", []byte("ouch")
+	for i := 0; i < 5; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+	_, err = fs.Compact(5)
+	require_NoError(t, err)
+
+	if state := fs.State(); state.LastSeq != 5 {
+		t.Fatalf("Expected last sequence to be 5 but got %d", state.LastSeq)
+	}
+	for i := 0; i < 5; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+	_, err = fs.Compact(10)
+	require_NoError(t, err)
+
+	if state := fs.State(); state.LastSeq != 10 {
+		t.Fatalf("Expected last sequence to be 10 but got %d", state.LastSeq)
+	}
+}
+
+// When we kept the empty block for tracking sequence, we needed to reset the bek
+// counter when encrypted for subsequent writes to be correct. The bek in place could
+// possibly still have a non-zero counter from previous writes.
+// Happens when all messages expire and the are flushed and then subsequent writes occur.
+func TestFileStoreEncryptedKeepIndexNeedBekResetBug(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(storeDir)
+
+	prf := func(context []byte) ([]byte, error) {
+		h := hmac.New(sha256.New, []byte("dlc22"))
+		if _, err := h.Write(context); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+
+	ttl := 250 * time.Millisecond
+	fs, err := newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: ttl},
+		time.Now(),
+		prf,
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	subj, msg := "foo", []byte("ouch")
+	for i := 0; i < 5; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+
+	// Want to go to 0.
+	// This will leave the marker.
+	checkFor(t, time.Second, ttl, func() error {
+		if state := fs.State(); state.Msgs != 0 {
+			return fmt.Errorf("Expected no msgs, got %d", state.Msgs)
+		}
+		return nil
+	})
+
+	// Now write additional messages.
+	for i := 0; i < 5; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+
+	// Make sure the buffer is cleared.
+	fs.mu.RLock()
+	mb := fs.lmb
+	fs.mu.RUnlock()
+	mb.mu.Lock()
+	mb.clearCacheAndOffset()
+	mb.mu.Unlock()
+
+	// Now make sure we can read.
+	var smv StoreMsg
+	_, err = fs.LoadMsg(10, &smv)
+	require_NoError(t, err)
+}
+
+func (fs *fileStore) reportMeta() (hasPSIM, hasAnyFSS bool) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	hasPSIM = fs.psim != nil
+	for _, mb := range fs.blks {
+		mb.mu.RLock()
+		hasAnyFSS = hasAnyFSS || mb.fss != nil
+		mb.mu.RUnlock()
+		if hasAnyFSS {
+			break
+		}
+	}
+	return hasPSIM, hasAnyFSS
+}
+
+func TestFileStoreExpireSubjectMeta(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 1024, CacheExpire: time.Second},
+		StreamConfig{Name: "zzz", Subjects: []string{"kv.>"}, Storage: FileStorage, MaxMsgsPer: 1},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	ns := 100
+	for i := 1; i <= ns; i++ {
+		subj := fmt.Sprintf("kv.%d", i)
+		_, _, err := fs.StoreMsg(subj, nil, []byte("value"))
+		require_NoError(t, err)
+	}
+
+	checkNoMeta := func() {
+		t.Helper()
+		if _, hasAnyFSS := fs.reportMeta(); hasAnyFSS {
+			t.Fatalf("Expected no mbs to have fss state")
+		}
+	}
+
+	// Test that on restart we do not have extensize metadata but do have correct number of subjects/keys.
+	// Only thing really needed for store state / stream info.
+	fs.Stop()
+	fs, err = newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 1024, CacheExpire: time.Second},
+		StreamConfig{Name: "zzz", Subjects: []string{"kv.>"}, Storage: FileStorage, MaxMsgsPer: 1},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	var ss StreamState
+	fs.FastState(&ss)
+	if ss.NumSubjects != ns {
+		t.Fatalf("Expected NumSubjects of %d, got %d", ns, ss.NumSubjects)
+	}
+
+	// Make sure we clear mb fss meta
+	checkFor(t, 10*time.Second, 500*time.Millisecond, func() error {
+		if _, hasAnyFSS := fs.reportMeta(); hasAnyFSS {
+			return fmt.Errorf("Still have mb fss state")
+		}
+		return nil
+	})
+
+	// Load by sequence should not load meta.
+	_, err = fs.LoadMsg(1, nil)
+	require_NoError(t, err)
+	checkNoMeta()
+
+	// LoadLast, which is what KV uses, should load meta and succeed.
+	_, err = fs.LoadLastMsg("kv.22", nil)
+	require_NoError(t, err)
+	// Make sure we clear mb fss meta
+	checkFor(t, 10*time.Second, 500*time.Millisecond, func() error {
+		if _, hasAnyFSS := fs.reportMeta(); hasAnyFSS {
+			return fmt.Errorf("Still have mb fss state")
+		}
+		return nil
+	})
+}
+
+func TestFileStoreMaxMsgsPerSubject(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 128, CacheExpire: time.Second},
+		StreamConfig{Name: "zzz", Subjects: []string{"kv.>"}, Storage: FileStorage, MaxMsgsPer: 1},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	ns := 100
+	for i := 1; i <= ns; i++ {
+		subj := fmt.Sprintf("kv.%d", i)
+		_, _, err := fs.StoreMsg(subj, nil, []byte("value"))
+		require_NoError(t, err)
+	}
+
+	for i := 1; i <= ns; i++ {
+		subj := fmt.Sprintf("kv.%d", i)
+		_, _, err := fs.StoreMsg(subj, nil, []byte("value"))
+		require_NoError(t, err)
+	}
+
+	if state := fs.State(); state.Msgs != 100 || state.FirstSeq != 101 || state.LastSeq != 200 || len(state.Deleted) != 0 {
+		t.Fatalf("Bad state: %+v", state)
+	}
+
+	if nb := fs.numMsgBlocks(); nb != 34 {
+		t.Fatalf("Expected 34 blocks, got %d", nb)
+	}
+}
+
+func TestFileStoreSubjectStateCacheExpiration(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 32, CacheExpire: time.Second},
+		StreamConfig{Name: "zzz", Subjects: []string{"kv.>"}, Storage: FileStorage, MaxMsgsPer: 2},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	for i := 1; i <= 100; i++ {
+		subj := fmt.Sprintf("kv.foo.%d", i)
+		_, _, err := fs.StoreMsg(subj, nil, []byte("value"))
+		require_NoError(t, err)
+	}
+	for i := 1; i <= 100; i++ {
+		subj := fmt.Sprintf("kv.bar.%d", i)
+		_, _, err := fs.StoreMsg(subj, nil, []byte("value"))
+		require_NoError(t, err)
+	}
+
+	// Make sure we clear mb fss meta before asking for SubjectState.
+	checkFor(t, 10*time.Second, 500*time.Millisecond, func() error {
+		if _, hasAnyFSS := fs.reportMeta(); hasAnyFSS {
+			return fmt.Errorf("Still have mb fss state")
+		}
+		return nil
+	})
+
+	if fss := fs.SubjectsState("kv.bar.>"); len(fss) != 100 {
+		t.Fatalf("Expected 100 entries but got %d", len(fss))
+	}
+
+	fss := fs.SubjectsState("kv.bar.99")
+	if len(fss) != 1 {
+		t.Fatalf("Expected 1 entry but got %d", len(fss))
+	}
+	expected := SimpleState{Msgs: 1, First: 199, Last: 199}
+	if ss := fss["kv.bar.99"]; ss != expected {
+		t.Fatalf("Bad subject state, expected %+v but got %+v", expected, ss)
+	}
+
+	// Now add one to end and check as well for non-wildcard.
+	_, _, err = fs.StoreMsg("kv.foo.1", nil, []byte("value22"))
+	require_NoError(t, err)
+
+	if state := fs.State(); state.Msgs != 201 {
+		t.Fatalf("Expected 201 msgs but got %+v", state)
+	}
+
+	fss = fs.SubjectsState("kv.foo.1")
+	if len(fss) != 1 {
+		t.Fatalf("Expected 1 entry but got %d", len(fss))
+	}
+	expected = SimpleState{Msgs: 2, First: 1, Last: 201}
+	if ss := fss["kv.foo.1"]; ss != expected {
+		t.Fatalf("Bad subject state, expected %+v but got %+v", expected, ss)
+	}
+}
+
+func TestFileStoreEncryptedAES(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(storeDir)
+
+	prf := func(context []byte) ([]byte, error) {
+		h := hmac.New(sha256.New, []byte("dlc22"))
+		if _, err := h.Write(context); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+
+	fs, err := newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir, Cipher: AES},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+		time.Now(),
+		prf,
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	subj, msg := "foo", []byte("aes ftw")
+	for i := 0; i < 50; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+
+	o, err := fs.ConsumerStore("o22", &ConsumerConfig{})
+	require_NoError(t, err)
+
+	state := &ConsumerState{}
+	state.Delivered.Consumer = 22
+	state.Delivered.Stream = 22
+	state.AckFloor.Consumer = 11
+	state.AckFloor.Stream = 11
+	err = o.Update(state)
+	require_NoError(t, err)
+
+	fs.Stop()
+
+	fs, err = newFileStoreWithCreated(
+		FileStoreConfig{StoreDir: storeDir, Cipher: AES},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+		time.Now(),
+		prf,
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Now make sure we can read.
+	var smv StoreMsg
+	sm, err := fs.LoadMsg(10, &smv)
+	require_NoError(t, err)
+	require_True(t, string(sm.msg) == "aes ftw")
+
+	o, err = fs.ConsumerStore("o22", &ConsumerConfig{})
+	require_NoError(t, err)
+	rstate, err := o.State()
+	require_NoError(t, err)
+
+	if rstate.Delivered != state.Delivered || rstate.AckFloor != state.AckFloor {
+		t.Fatalf("Bad recovered consumer state, expected %+v got %+v", state, rstate)
+	}
+}
+
+// Make sure we do not go through block loads when we know no subjects will exists, e.g. raft.
+func TestFileStoreNoFSSWhenNoSubjects(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	n, msg := 100, []byte("raft state")
+	for i := 0; i < n; i++ {
+		_, _, err := fs.StoreMsg(_EMPTY_, nil, msg)
+		require_NoError(t, err)
+	}
+
+	state := fs.State()
+	require_True(t, state.Msgs == uint64(n))
+
+	fs.Stop()
+	fs, err = newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Make sure we did not load the block trying to generate fss.
+	fs.mu.RLock()
+	mb := fs.blks[0]
+	fs.mu.RUnlock()
+
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.cloads > 0 {
+		t.Fatalf("Expected no cache loads but got %d", mb.cloads)
+	}
+	if mb.fss != nil {
+		t.Fatalf("Expected fss to be nil")
+	}
+}
+
+func TestFileStoreNoFSSBugAfterRemoveFirst(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 8 * 1024 * 1024, CacheExpire: 200 * time.Millisecond},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.bar.*"}, Storage: FileStorage},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	n, msg := 100, bytes.Repeat([]byte("ZZZ"), 33) // ~100bytes
+	for i := 0; i < n; i++ {
+		subj := fmt.Sprintf("foo.bar.%d", i)
+		_, _, err := fs.StoreMsg(subj, nil, msg)
+		require_NoError(t, err)
+	}
+
+	state := fs.State()
+	require_True(t, state.Msgs == uint64(n))
+
+	// Let fss expire.
+	time.Sleep(250 * time.Millisecond)
+
+	_, err = fs.RemoveMsg(1)
+	require_NoError(t, err)
+
+	sm, _, err := fs.LoadNextMsg("foo.>", true, 1, nil)
+	require_NoError(t, err)
+	require_True(t, sm.subj == "foo.bar.1")
+
+	// Make sure mb.fss does not have the entry for foo.bar.0
+	fs.mu.Lock()
+	mb := fs.blks[0]
+	fs.mu.Unlock()
+	mb.mu.RLock()
+	ss := mb.fss["foo.bar.0"]
+	mb.mu.RUnlock()
+
+	if ss != nil {
+		t.Fatalf("Expected no state for %q, but got %+v\n", "foo.bar.0", ss)
+	}
+}
+
+func TestFileStoreNoFSSAfterRecover(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	n, msg := 100, []byte("no fss for you!")
+	for i := 0; i < n; i++ {
+		_, _, err := fs.StoreMsg(_EMPTY_, nil, msg)
+		require_NoError(t, err)
+	}
+
+	state := fs.State()
+	require_True(t, state.Msgs == uint64(n))
+
+	fs.Stop()
+	fs, err = newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Make sure we did not load the block trying to generate fss.
+	fs.mu.RLock()
+	mb := fs.blks[0]
+	fs.mu.RUnlock()
+
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.fss != nil {
+		t.Fatalf("Expected no fss post recover")
+	}
 }

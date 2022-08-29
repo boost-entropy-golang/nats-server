@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3158,7 +3157,7 @@ func TestJWTExpiredUserCredentialsRenewal(t *testing.T) {
 		conf := createFile(t, "")
 		fName := conf.Name()
 		conf.Close()
-		if err := ioutil.WriteFile(fName, content, 0666); err != nil {
+		if err := os.WriteFile(fName, content, 0666); err != nil {
 			removeFile(t, fName)
 			t.Fatalf("Error writing conf file: %v", err)
 		}
@@ -3243,7 +3242,7 @@ func TestJWTExpiredUserCredentialsRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error encoding credentials: %v", err)
 	}
-	if err := ioutil.WriteFile(chainedFile, creds, 0666); err != nil {
+	if err := os.WriteFile(chainedFile, creds, 0666); err != nil {
 		t.Fatalf("Error writing conf file: %v", err)
 	}
 
@@ -3317,7 +3316,7 @@ func require_JWTPresent(t *testing.T, dir string, pub string) {
 
 func require_JWTEqual(t *testing.T, dir string, pub string, jwt string) {
 	t.Helper()
-	content, err := ioutil.ReadFile(filepath.Join(dir, pub+".jwt"))
+	content, err := os.ReadFile(filepath.Join(dir, pub+".jwt"))
 	require_NoError(t, err)
 	require_Equal(t, string(content), jwt)
 }
@@ -3326,7 +3325,7 @@ func createDir(t testing.TB, prefix string) string {
 	t.Helper()
 	err := os.MkdirAll(tempRoot, 0700)
 	require_NoError(t, err)
-	dir, err := ioutil.TempDir(tempRoot, prefix)
+	dir, err := os.MkdirTemp(tempRoot, prefix)
 	require_NoError(t, err)
 	return dir
 }
@@ -3340,7 +3339,7 @@ func createFile(t *testing.T, prefix string) *os.File {
 
 func createFileAtDir(t *testing.T, dir, prefix string) *os.File {
 	t.Helper()
-	f, err := ioutil.TempFile(dir, prefix)
+	f, err := os.CreateTemp(dir, prefix)
 	require_NoError(t, err)
 	return f
 }
@@ -3361,7 +3360,7 @@ func removeFile(t *testing.T, p string) {
 
 func writeJWT(t *testing.T, dir string, pub string, jwt string) {
 	t.Helper()
-	err := ioutil.WriteFile(filepath.Join(dir, pub+".jwt"), []byte(jwt), 0644)
+	err := os.WriteFile(filepath.Join(dir, pub+".jwt"), []byte(jwt), 0644)
 	require_NoError(t, err)
 }
 
@@ -4107,6 +4106,219 @@ func TestJWTTimeExpiration(t *testing.T) {
 	})
 }
 
+func NewJwtAccountClaim(name string) (nkeys.KeyPair, string, *jwt.AccountClaims) {
+	sysKp, _ := nkeys.CreateAccount()
+	sysPub, _ := sysKp.PublicKey()
+	claim := jwt.NewAccountClaims(sysPub)
+	claim.Name = name
+	return sysKp, sysPub, claim
+}
+
+func TestJWTSysImportForDifferentAccount(t *testing.T) {
+	_, sysPub, sysClaim := NewJwtAccountClaim("SYS")
+	sysClaim.Exports.Add(&jwt.Export{
+		Type:    jwt.Service,
+		Subject: "$SYS.REQ.ACCOUNT.*.INFO",
+	})
+	sysJwt, err := sysClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	// create account
+	aKp, aPub, claim := NewJwtAccountClaim("A")
+	claim.Imports.Add(&jwt.Import{
+		Type:         jwt.Service,
+		Subject:      "$SYS.REQ.ACCOUNT.*.INFO",
+		LocalSubject: "COMMON.ADVISORY.SYS.REQ.ACCOUNT.*.INFO",
+		Account:      sysPub,
+	})
+	aJwt, err := claim.Encode(oKp)
+	require_NoError(t, err)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+			%s: %s
+		}
+    `, ojwt, sysPub, sysPub, sysJwt, aPub, aJwt)))
+	defer removeFile(t, conf)
+	sA, _ := RunServerWithConfig(conf)
+	defer sA.Shutdown()
+
+	nc := natsConnect(t, sA.ClientURL(), createUserCreds(t, nil, aKp))
+	defer nc.Close()
+	// user for account a requests for a different account, the system account
+	m, err := nc.Request(fmt.Sprintf("COMMON.ADVISORY.SYS.REQ.ACCOUNT.%s.INFO", sysPub), nil, time.Second)
+	require_NoError(t, err)
+	resp := &ServerAPIResponse{}
+	require_NoError(t, json.Unmarshal(m.Data, resp))
+	require_True(t, resp.Error == nil)
+}
+
+func TestJWTSysImportFromNothing(t *testing.T) {
+	_, sysPub, sysClaim := NewJwtAccountClaim("SYS")
+	sysJwt, err := sysClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	// create account
+	aKp, aPub, claim := NewJwtAccountClaim("A")
+	claim.Imports.Add(&jwt.Import{
+		Type: jwt.Service,
+		// fails as it's not for own account, but system account
+		Subject:      jwt.Subject(fmt.Sprintf("$SYS.REQ.ACCOUNT.%s.CONNZ", sysPub)),
+		LocalSubject: "fail1",
+		Account:      sysPub,
+	})
+	claim.Imports.Add(&jwt.Import{
+		Type: jwt.Service,
+		// fails as it's not for own account but all accounts
+		Subject:      "$SYS.REQ.ACCOUNT.*.CONNZ",
+		LocalSubject: "fail2.*",
+		Account:      sysPub,
+	})
+	claim.Imports.Add(&jwt.Import{
+		Type:         jwt.Service,
+		Subject:      jwt.Subject(fmt.Sprintf("$SYS.REQ.ACCOUNT.%s.CONNZ", aPub)),
+		LocalSubject: "pass",
+		Account:      sysPub,
+	})
+	aJwt, err := claim.Encode(oKp)
+	require_NoError(t, err)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+			%s: %s
+		}
+    `, ojwt, sysPub, sysPub, sysJwt, aPub, aJwt)))
+	defer removeFile(t, conf)
+	sA, _ := RunServerWithConfig(conf)
+	defer sA.Shutdown()
+
+	nc := natsConnect(t, sA.ClientURL(), createUserCreds(t, nil, aKp))
+	defer nc.Close()
+	// user for account a requests for a different account, the system account
+	_, err = nc.Request("pass", nil, time.Second)
+	require_NoError(t, err)
+	// default import
+	_, err = nc.Request("$SYS.REQ.ACCOUNT.PING.CONNZ", nil, time.Second)
+	require_NoError(t, err)
+	_, err = nc.Request("fail1", nil, time.Second)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "no responders")
+	// fails even for own account, as the import itself is bad
+	_, err = nc.Request("fail2."+aPub, nil, time.Second)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "no responders")
+}
+
+func TestJWTSysImportOverwritePublic(t *testing.T) {
+	_, sysPub, sysClaim := NewJwtAccountClaim("SYS")
+	// this changes the export permissions to allow for requests for every account
+	sysClaim.Exports.Add(&jwt.Export{
+		Type:    jwt.Service,
+		Subject: "$SYS.REQ.ACCOUNT.*.>",
+	})
+	sysJwt, err := sysClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	// create account
+	aKp, aPub, claim := NewJwtAccountClaim("A")
+	claim.Imports.Add(&jwt.Import{
+		Type:         jwt.Service,
+		Subject:      jwt.Subject(fmt.Sprintf("$SYS.REQ.ACCOUNT.%s.CONNZ", sysPub)),
+		LocalSubject: "pass1",
+		Account:      sysPub,
+	})
+	claim.Imports.Add(&jwt.Import{
+		Type:         jwt.Service,
+		Subject:      jwt.Subject(fmt.Sprintf("$SYS.REQ.ACCOUNT.%s.CONNZ", aPub)),
+		LocalSubject: "pass2",
+		Account:      sysPub,
+	})
+	claim.Imports.Add(&jwt.Import{
+		Type:         jwt.Service,
+		Subject:      "$SYS.REQ.ACCOUNT.*.CONNZ",
+		LocalSubject: "pass3.*",
+		Account:      sysPub,
+	})
+	aJwt, err := claim.Encode(oKp)
+	require_NoError(t, err)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+			%s: %s
+		}
+    `, ojwt, sysPub, sysPub, sysJwt, aPub, aJwt)))
+	defer removeFile(t, conf)
+	sA, _ := RunServerWithConfig(conf)
+	defer sA.Shutdown()
+
+	nc := natsConnect(t, sA.ClientURL(), createUserCreds(t, nil, aKp))
+	defer nc.Close()
+	// user for account a requests for a different account, the system account
+	_, err = nc.Request("pass1", nil, time.Second)
+	require_NoError(t, err)
+	_, err = nc.Request("pass2", nil, time.Second)
+	require_NoError(t, err)
+	_, err = nc.Request("pass3."+sysPub, nil, time.Second)
+	require_NoError(t, err)
+	_, err = nc.Request("pass3."+aPub, nil, time.Second)
+	require_NoError(t, err)
+	_, err = nc.Request("pass3.PING", nil, time.Second)
+	require_NoError(t, err)
+}
+
+func TestJWTSysImportOverwriteToken(t *testing.T) {
+	_, sysPub, sysClaim := NewJwtAccountClaim("SYS")
+	// this changes the export permissions in a way that the internal imports can't satisfy
+	sysClaim.Exports.Add(&jwt.Export{
+		Type:     jwt.Service,
+		Subject:  "$SYS.REQ.>",
+		TokenReq: true,
+	})
+
+	sysJwt, err := sysClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	// create account
+	aKp, aPub, claim := NewJwtAccountClaim("A")
+	aJwt, err := claim.Encode(oKp)
+	require_NoError(t, err)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+			%s: %s
+		}
+    `, ojwt, sysPub, sysPub, sysJwt, aPub, aJwt)))
+	defer removeFile(t, conf)
+	sA, _ := RunServerWithConfig(conf)
+	defer sA.Shutdown()
+
+	nc := natsConnect(t, sA.ClientURL(), createUserCreds(t, nil, aKp))
+	defer nc.Close()
+	// make sure the internal import still got added
+	_, err = nc.Request("$SYS.REQ.ACCOUNT.PING.CONNZ", nil, time.Second)
+	require_NoError(t, err)
+}
+
 func TestJWTLimits(t *testing.T) {
 	doNotExpire := time.Now().AddDate(1, 0, 0)
 	// create account
@@ -4160,6 +4372,126 @@ func TestJWTLimits(t *testing.T) {
 		}
 		if err := c.Publish("foo", []byte("worldX")); err != nats.ErrMaxPayload {
 			t.Fatalf("couldn't publish: %v", err)
+		}
+	})
+}
+
+func TestJwtTemplates(t *testing.T) {
+	kp, _ := nkeys.CreateAccount()
+	aPub, _ := kp.PublicKey()
+	ukp, _ := nkeys.CreateUser()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Name = "myname"
+	uclaim.Subject = upub
+	uclaim.SetScoped(true)
+	uclaim.IssuerAccount = aPub
+	uclaim.Tags.Add("foo:foo1")
+	uclaim.Tags.Add("foo:foo2")
+	uclaim.Tags.Add("bar:bar1")
+	uclaim.Tags.Add("bar:bar2")
+	uclaim.Tags.Add("bar:bar3")
+
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("{{tag(foo)}}.none.{{tag(bar)}}")
+	lim.Pub.Deny.Add("{{tag(foo)}}.{{account-tag(acc)}}")
+	lim.Sub.Allow.Add("{{tag(NOT_THERE)}}") // expect to not emit this
+	lim.Sub.Deny.Add("foo.{{name()}}.{{subject()}}.{{account-name()}}.{{account-subject()}}.bar")
+	acc := &Account{nameTag: "accname", tags: []string{"acc:acc1", "acc:acc2"}}
+
+	resLim, err := processUserPermissionsTemplate(lim, uclaim, acc)
+	require_NoError(t, err)
+
+	test := func(expectedSubjects []string, res jwt.StringList) {
+		t.Helper()
+		require_True(t, len(res) == len(expectedSubjects))
+		for _, expetedSubj := range expectedSubjects {
+			require_True(t, res.Contains(expetedSubj))
+		}
+	}
+
+	test(resLim.Pub.Allow, []string{"foo1.none.bar1", "foo1.none.bar2", "foo1.none.bar3",
+		"foo2.none.bar1", "foo2.none.bar2", "foo2.none.bar3"})
+
+	test(resLim.Pub.Deny, []string{"foo1.acc1", "foo1.acc2", "foo2.acc1", "foo2.acc2"})
+
+	require_True(t, len(resLim.Sub.Allow) == 0)
+	require_True(t, len(resLim.Sub.Deny) == 2)
+	require_Contains(t, resLim.Sub.Deny[0], fmt.Sprintf("foo.myname.%s.accname.%s.bar", upub, aPub))
+	// added in to compensate for sub allow not resolving
+	require_Contains(t, resLim.Sub.Deny[1], ">")
+
+	lim.Pub.Deny.Add("{{tag(NOT_THERE)}}")
+	_, err = processUserPermissionsTemplate(lim, uclaim, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "generated invalid subject")
+}
+
+func TestJWTLimitsTemplate(t *testing.T) {
+	kp, _ := nkeys.CreateAccount()
+	aPub, _ := kp.PublicKey()
+	claim := jwt.NewAccountClaims(aPub)
+	aSignScopedKp, aSignScopedPub := createKey(t)
+	signer := jwt.NewUserScope()
+	signer.Key = aSignScopedPub
+	signer.Template.Pub.Deny.Add("denied")
+	signer.Template.Pub.Allow.Add("foo.{{name()}}")
+	signer.Template.Sub.Allow.Add("foo.{{name()}}")
+	claim.SigningKeys.AddScopedSigner(signer)
+	aJwt, err := claim.Encode(oKp)
+	require_NoError(t, err)
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+		}
+    `, ojwt, aPub, aJwt)))
+	defer removeFile(t, conf)
+	sA, _ := RunServerWithConfig(conf)
+	defer sA.Shutdown()
+	errChan := make(chan struct{})
+	defer close(errChan)
+
+	ukp, _ := nkeys.CreateUser()
+	seed, _ := ukp.Seed()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Name = "myname"
+	uclaim.Subject = upub
+	uclaim.SetScoped(true)
+	uclaim.IssuerAccount = aPub
+
+	ujwt, err := uclaim.Encode(aSignScopedKp)
+	require_NoError(t, err)
+	creds := genCredsFile(t, ujwt, seed)
+
+	defer removeFile(t, creds)
+
+	t.Run("pass", func(t *testing.T) {
+		c := natsConnect(t, sA.ClientURL(), nats.UserCredentials(creds))
+		defer c.Close()
+		sub, err := c.SubscribeSync("foo.myname")
+		require_NoError(t, err)
+		require_NoError(t, c.Flush())
+		require_NoError(t, c.Publish("foo.myname", nil))
+		_, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+	})
+	t.Run("fail", func(t *testing.T) {
+		c := natsConnect(t, sA.ClientURL(), nats.UserCredentials(creds),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+				if strings.Contains(err.Error(), `nats: Permissions Violation for Publish to "foo.othername"`) {
+					errChan <- struct{}{}
+				}
+			}))
+		defer c.Close()
+		require_NoError(t, c.Publish("foo.othername", nil))
+		select {
+		case <-errChan:
+		case <-time.After(time.Second * 2):
+			require_True(t, false)
 		}
 	})
 }
@@ -4326,8 +4658,14 @@ func TestJWTActivationRevocation(t *testing.T) {
 		aExp1Jwt := encodeClaim(t, aExpClaim, aExpPub)
 		aExpCreds := newUser(t, aExpKp)
 
-		time.Sleep(1100 * time.Millisecond)
 		aImpKp, aImpPub := createKey(t)
+
+		ac := &jwt.ActivationClaims{}
+		ac.Subject = aImpPub
+		ac.ImportSubject = "foo"
+		ac.ImportType = jwt.Stream
+		token, err := ac.Encode(aExpKp)
+		require_NoError(t, err)
 
 		revPubKey := aImpPub
 		if all {
@@ -4339,13 +4677,6 @@ func TestJWTActivationRevocation(t *testing.T) {
 
 		aExpClaim.Exports[0].ClearRevocation(revPubKey)
 		aExp3Jwt := encodeClaim(t, aExpClaim, aExpPub)
-
-		ac := &jwt.ActivationClaims{}
-		ac.Subject = aImpPub
-		ac.ImportSubject = "foo"
-		ac.ImportType = jwt.Stream
-		token, err := ac.Encode(aExpKp)
-		require_NoError(t, err)
 
 		aImpClaim := jwt.NewAccountClaims(aImpPub)
 		aImpClaim.Name = "Import"

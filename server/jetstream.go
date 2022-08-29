@@ -19,9 +19,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -35,7 +33,6 @@ import (
 	"github.com/nats-io/nats-server/v2/server/sysmem"
 	"github.com/nats-io/nkeys"
 	"github.com/nats-io/nuid"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // JetStreamConfig determines this server's configuration.
@@ -94,20 +91,22 @@ type JetStreamAPIStats struct {
 // This is for internal accounting for JetStream for this server.
 type jetStream struct {
 	// These are here first because of atomics on 32bit systems.
-	apiInflight    int64
-	apiTotal       int64
-	apiErrors      int64
-	memReserved    int64
-	storeReserved  int64
-	memUsed        int64
-	storeUsed      int64
-	clustered      int32
-	mu             sync.RWMutex
-	srv            *Server
-	config         JetStreamConfig
-	cluster        *jetStreamCluster
-	accounts       map[string]*jsAccount
-	apiSubs        *Sublist
+	apiInflight   int64
+	apiTotal      int64
+	apiErrors     int64
+	memReserved   int64
+	storeReserved int64
+	memUsed       int64
+	storeUsed     int64
+	clustered     int32
+	mu            sync.RWMutex
+	srv           *Server
+	config        JetStreamConfig
+	cluster       *jetStreamCluster
+	accounts      map[string]*jsAccount
+	apiSubs       *Sublist
+	// System level request to purge a stream move
+	accountPurge   *subscription
 	metaRecovering bool
 	standAlone     bool
 	disabled       bool
@@ -201,10 +200,6 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 		return err
 	}
 
-	if ek := s.getOpts().JetStreamKey; ek != _EMPTY_ {
-		s.Warnf("JetStream Encryption is Beta")
-	}
-
 	return s.enableJetStream(cfg)
 }
 
@@ -230,9 +225,9 @@ func (s *Server) jsKeyGen(info string) keyGen {
 }
 
 // Decode the encrypted metafile.
-func (s *Server) decryptMeta(ekey, buf []byte, acc, context string) ([]byte, error) {
-	if len(ekey) != metaKeySize {
-		return nil, errors.New("bad encryption key")
+func (s *Server) decryptMeta(sc StoreCipher, ekey, buf []byte, acc, context string) ([]byte, error) {
+	if len(ekey) < minMetaKeySize {
+		return nil, errBadKeySize
 	}
 	prf := s.jsKeyGen(acc)
 	if prf == nil {
@@ -242,7 +237,8 @@ func (s *Server) decryptMeta(ekey, buf []byte, acc, context string) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	kek, err := chacha20poly1305.NewX(rb)
+
+	kek, err := genEncryptionKey(sc, rb)
 	if err != nil {
 		return nil, err
 	}
@@ -251,11 +247,10 @@ func (s *Server) decryptMeta(ekey, buf []byte, acc, context string) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	aek, err := chacha20poly1305.NewX(seed[:])
+	aek, err := genEncryptionKey(sc, seed)
 	if err != nil {
 		return nil, err
 	}
-	ns = kek.NonceSize()
 	plain, err := aek.Open(nil, buf[:ns], buf[ns:], nil)
 	if err != nil {
 		return nil, err
@@ -266,14 +261,14 @@ func (s *Server) decryptMeta(ekey, buf []byte, acc, context string) ([]byte, err
 // Check to make sure directory has the jetstream directory.
 // We will have it properly configured here now regardless, so need to look inside.
 func (s *Server) checkStoreDir(cfg *JetStreamConfig) error {
-	fis, _ := ioutil.ReadDir(cfg.StoreDir)
+	fis, _ := os.ReadDir(cfg.StoreDir)
 	// If we have nothing underneath us, could be just starting new, but if we see this we can check.
 	if len(fis) != 0 {
 		return nil
 	}
 	// Let's check the directory above. If it has us 'jetstream' but also other stuff that we can
 	// identify as accounts then we can fix.
-	fis, _ = ioutil.ReadDir(filepath.Dir(cfg.StoreDir))
+	fis, _ = os.ReadDir(filepath.Dir(cfg.StoreDir))
 	// If just one that is us 'jetstream' and all is ok.
 	if len(fis) == 1 {
 		return nil
@@ -342,7 +337,7 @@ func (s *Server) enableJetStream(cfg JetStreamConfig) error {
 		if stat == nil || !stat.IsDir() {
 			return fmt.Errorf("storage directory is not a directory")
 		}
-		tmpfile, err := ioutil.TempFile(cfg.StoreDir, "_test_")
+		tmpfile, err := os.CreateTemp(cfg.StoreDir, "_test_")
 		if err != nil {
 			return fmt.Errorf("storage directory is not writable")
 		}
@@ -369,6 +364,10 @@ func (s *Server) enableJetStream(cfg JetStreamConfig) error {
 	s.Noticef("  Store Directory: \"%s\"", cfg.StoreDir)
 	if cfg.Domain != _EMPTY_ {
 		s.Noticef("  Domain:          %s", cfg.Domain)
+	}
+	opts := s.getOpts()
+	if ek := opts.JetStreamKey; ek != _EMPTY_ {
+		s.Noticef("  Encryption:      %s", opts.JetStreamCipher)
 	}
 	s.Noticef("-------------------------------------------")
 
@@ -689,6 +688,21 @@ func (s *Server) configAllJetStreamAccounts() error {
 		return nil
 	}
 
+	if s.sys != nil {
+		// clustered stream removal will perform this cleanup as well
+		// this is mainly for initial cleanup
+		saccName := s.sys.account.Name
+		accStoreDirs, _ := os.ReadDir(js.config.StoreDir)
+		for _, acc := range accStoreDirs {
+			if accName := acc.Name(); accName != saccName {
+				// no op if not empty
+				accDir := filepath.Join(js.config.StoreDir, accName)
+				os.Remove(filepath.Join(accDir, streamsDir))
+				os.Remove(accDir)
+			}
+		}
+	}
+
 	var jsAccounts []*Account
 	s.accounts.Range(func(k, v interface{}) bool {
 		jsAccounts = append(jsAccounts, v.(*Account))
@@ -707,7 +721,7 @@ func (s *Server) configAllJetStreamAccounts() error {
 
 	// Now walk all the storage we have and resolve any accounts that we did not process already.
 	// This is important in resolver/operator models.
-	fis, _ := ioutil.ReadDir(js.config.StoreDir)
+	fis, _ := os.ReadDir(js.config.StoreDir)
 	for _, fi := range fis {
 		if accName := fi.Name(); accName != _EMPTY_ {
 			// Only load up ones not already loaded since they are processed above.
@@ -741,6 +755,12 @@ func (js *jetStream) setJetStreamStandAlone(isStandAlone bool) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 	js.standAlone = isStandAlone
+
+	if isStandAlone {
+		js.accountPurge, _ = js.srv.systemSubscribe(JSApiAccountPurge, _EMPTY_, false, nil, js.srv.jsLeaderAccountPurgeRequest)
+	} else if js.accountPurge != nil {
+		js.srv.sysUnsubscribe(js.accountPurge)
+	}
 }
 
 // JetStreamEnabled reports if jetstream is enabled for this server.
@@ -872,14 +892,20 @@ func (s *Server) shutdownJetStream() {
 	var _a [512]*Account
 	accounts := _a[:0]
 
-	js.mu.RLock()
+	js.mu.Lock()
 	// Collect accounts.
 	for _, jsa := range js.accounts {
 		if a := jsa.acc(); a != nil {
 			accounts = append(accounts, a)
 		}
 	}
-	js.mu.RUnlock()
+	accPurgeSub := js.accountPurge
+	js.accountPurge = nil
+	js.mu.Unlock()
+
+	if accPurgeSub != nil {
+		s.sysUnsubscribe(accPurgeSub)
+	}
 
 	for _, a := range accounts {
 		a.removeJetStream()
@@ -948,9 +974,9 @@ func (s *Server) JetStreamReservedResources() (int64, int64, error) {
 }
 
 func (s *Server) getJetStream() *jetStream {
-	s.mu.Lock()
+	s.mu.RLock()
 	js := s.js
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return js
 }
 
@@ -1052,7 +1078,8 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		// Just need to make sure we can write to the directory.
 		// Remove the directory will create later if needed.
 		os.RemoveAll(sdir)
-
+		// when empty remove parent directory, which may have been created as well
+		os.Remove(jsa.storeDir)
 	} else {
 		// Restore any state here.
 		s.Debugf("Recovering JetStream state for account %q", a.Name)
@@ -1067,11 +1094,11 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		if err != nil {
 			return err
 		}
-		fis, _ := ioutil.ReadDir(tdir)
+		fis, _ := os.ReadDir(tdir)
 		for _, fi := range fis {
 			metafile := filepath.Join(tdir, fi.Name(), JetStreamMetaFile)
 			metasum := filepath.Join(tdir, fi.Name(), JetStreamMetaFileSum)
-			buf, err := ioutil.ReadFile(metafile)
+			buf, err := os.ReadFile(metafile)
 			if err != nil {
 				s.Warnf("  Error reading StreamTemplate metafile %q: %v", metasum, err)
 				continue
@@ -1080,7 +1107,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 				s.Warnf("  Missing StreamTemplate checksum for %q", metasum)
 				continue
 			}
-			sum, err := ioutil.ReadFile(metasum)
+			sum, err := os.ReadFile(metasum)
 			if err != nil {
 				s.Warnf("  Error reading StreamTemplate checksum %q: %v", metasum, err)
 				continue
@@ -1112,8 +1139,13 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 	}
 	var consumers []*ce
 
+	// Remember if we should be encrypted and what cipher we think we should use.
+	encrypted := s.getOpts().JetStreamKey != _EMPTY_
+	plaintext := true
+	sc := s.getOpts().JetStreamCipher
+
 	// Now recover the streams.
-	fis, _ := ioutil.ReadDir(sdir)
+	fis, _ := os.ReadDir(sdir)
 	for _, fi := range fis {
 		mdir := filepath.Join(sdir, fi.Name())
 		key := sha256.Sum256([]byte(fi.Name()))
@@ -1127,7 +1159,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 			s.Warnf("  Missing stream metafile for %q", metafile)
 			continue
 		}
-		buf, err := ioutil.ReadFile(metafile)
+		buf, err := os.ReadFile(metafile)
 		if err != nil {
 			s.Warnf("  Error reading metafile %q: %v", metafile, err)
 			continue
@@ -1136,7 +1168,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 			s.Warnf("  Missing stream checksum file %q", metasum)
 			continue
 		}
-		sum, err := ioutil.ReadFile(metasum)
+		sum, err := os.ReadFile(metasum)
 		if err != nil {
 			s.Warnf("  Error reading Stream metafile checksum %q: %v", metasum, err)
 			continue
@@ -1148,18 +1180,40 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 			continue
 		}
 
+		// Track if we are converting ciphers.
+		var osc StoreCipher
+		var convertingCiphers bool
+
 		// Check if we are encrypted.
-		if key, err := ioutil.ReadFile(filepath.Join(mdir, JetStreamMetaFileKey)); err == nil {
+		keyFile := filepath.Join(mdir, JetStreamMetaFileKey)
+		if key, err := os.ReadFile(keyFile); err == nil {
 			s.Debugf("  Stream metafile is encrypted, reading encrypted keyfile")
-			if len(key) != metaKeySize {
+			if len(key) < minMetaKeySize {
 				s.Warnf("  Bad stream encryption key length of %d", len(key))
 				continue
 			}
 			// Decode the buffer before proceeding.
-			if buf, err = s.decryptMeta(key, buf, a.Name, fi.Name()); err != nil {
-				s.Warnf("  Error decrypting our stream metafile: %v", err)
-				continue
+			nbuf, err := s.decryptMeta(sc, key, buf, a.Name, fi.Name())
+			if err != nil {
+				// See if we are changing ciphers.
+				switch sc {
+				case ChaCha:
+					nbuf, err = s.decryptMeta(AES, key, buf, a.Name, fi.Name())
+					osc, convertingCiphers = AES, true
+				case AES:
+					nbuf, err = s.decryptMeta(ChaCha, key, buf, a.Name, fi.Name())
+					osc, convertingCiphers = ChaCha, true
+				}
+				if err != nil {
+					s.Warnf("  Error decrypting our stream metafile: %v", err)
+					continue
+				}
 			}
+			buf = nbuf
+			plaintext = false
+
+			// Remove the key file to have system regenerate with the new cipher.
+			os.Remove(keyFile)
 		}
 
 		var cfg FileStreamInfo
@@ -1203,6 +1257,17 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 			cfg.StreamConfig.Subjects = nil
 		}
 
+		s.Noticef("  Starting restore for stream '%s > %s'", a.Name, cfg.StreamConfig.Name)
+
+		// Log if we are converting from plaintext to encrypted.
+		if encrypted {
+			if plaintext {
+				s.Noticef("  Encrypting stream '%s > %s'", a.Name, cfg.StreamConfig.Name)
+			} else if convertingCiphers {
+				s.Noticef("  Converting from %s to %s for stream '%s > %s'", osc, sc, a.Name, cfg.StreamConfig.Name)
+			}
+		}
+
 		// Add in the stream.
 		mset, err := a.addStream(&cfg.StreamConfig)
 		if err != nil {
@@ -1222,7 +1287,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 	}
 
 	for _, e := range consumers {
-		ofis, _ := ioutil.ReadDir(e.odir)
+		ofis, _ := os.ReadDir(e.odir)
 		if len(ofis) > 0 {
 			s.Noticef("  Recovering %d consumers for stream - '%s > %s'", len(ofis), e.mset.accName(), e.mset.name())
 		}
@@ -1233,7 +1298,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 				s.Warnf("    Missing consumer metafile %q", metafile)
 				continue
 			}
-			buf, err := ioutil.ReadFile(metafile)
+			buf, err := os.ReadFile(metafile)
 			if err != nil {
 				s.Warnf("    Error reading consumer metafile %q: %v", metafile, err)
 				continue
@@ -1244,13 +1309,25 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 			}
 
 			// Check if we are encrypted.
-			if key, err := ioutil.ReadFile(filepath.Join(e.odir, ofi.Name(), JetStreamMetaFileKey)); err == nil {
+			if key, err := os.ReadFile(filepath.Join(e.odir, ofi.Name(), JetStreamMetaFileKey)); err == nil {
 				s.Debugf("  Consumer metafile is encrypted, reading encrypted keyfile")
 				// Decode the buffer before proceeding.
-				if buf, err = s.decryptMeta(key, buf, a.Name, e.mset.name()+tsep+ofi.Name()); err != nil {
-					s.Warnf("  Error decrypting our consumer metafile: %v", err)
-					continue
+				ctxName := e.mset.name() + tsep + ofi.Name()
+				nbuf, err := s.decryptMeta(sc, key, buf, a.Name, ctxName)
+				if err != nil {
+					// See if we are changing ciphers.
+					switch sc {
+					case ChaCha:
+						nbuf, err = s.decryptMeta(AES, key, buf, a.Name, ctxName)
+					case AES:
+						nbuf, err = s.decryptMeta(ChaCha, key, buf, a.Name, ctxName)
+					}
+					if err != nil {
+						s.Warnf("  Error decrypting our consumer metafile: %v", err)
+						continue
+					}
 				}
+				buf = nbuf
 			}
 
 			var cfg FileConsumerInfo
@@ -1586,7 +1663,12 @@ func (a *Account) jetStreamConfigured() bool {
 		return false
 	}
 	a.mu.RLock()
-	defer a.mu.RUnlock()
+	jsc := a.jetStreamConfiguredNoLock()
+	a.mu.RUnlock()
+	return jsc
+}
+
+func (a *Account) jetStreamConfiguredNoLock() bool {
 	return len(a.jsLimits) > 0
 }
 
@@ -1712,7 +1794,7 @@ func (jsa *jsAccount) updateUsage(tierName string, storeType StorageType, delta 
 	}
 }
 
-const usageTick = 1500 * time.Millisecond
+var usageTick = 1500 * time.Millisecond
 
 func (jsa *jsAccount) sendClusterUsageUpdateTimer() {
 	jsa.usageMu.Lock()

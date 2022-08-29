@@ -2708,11 +2708,17 @@ CHECK:
 			// Will hold this client for a second and then close it. We
 			// do this so that if the client has a reconnect feature we
 			// don't end-up with very rapid flapping between apps.
-			time.AfterFunc(mqttSessJailDur, func() {
-				c.closeConnection(DuplicateClientID)
-			})
+			// We need to wait in place and not schedule the connection
+			// close because if this is a misbehaved client that does
+			// not wait for the CONNACK and sends other protocols, the
+			// server would not have a fully setup client and may panic.
 			asm.mu.Unlock()
-			return nil
+			select {
+			case <-s.quitCh:
+			case <-time.After(mqttSessJailDur):
+			}
+			c.closeConnection(DuplicateClientID)
+			return ErrConnectionClosed
 		}
 	}
 	// If an existing session is in the process of processing some packet, we can't
@@ -3825,11 +3831,11 @@ func mqttFilterToNATSSubject(filter []byte) ([]byte, error) {
 // - '/' is the topic level separator.
 //
 // Conversion that occurs:
-// - '/' is replaced with '/.' if it is the first character in mt
-// - '/' is replaced with './' if the last or next character in mt is '/'
-//   For instance, foo//bar would become foo./.bar
-// - '/' is replaced with '.' for all other conditions (foo/bar -> foo.bar)
-// - '.' and ' ' cause an error to be returned.
+//   - '/' is replaced with '/.' if it is the first character in mt
+//   - '/' is replaced with './' if the last or next character in mt is '/'
+//     For instance, foo//bar would become foo./.bar
+//   - '/' is replaced with '.' for all other conditions (foo/bar -> foo.bar)
+//   - '.' and ' ' cause an error to be returned.
 //
 // If there is no need to convert anything (say "foo" remains "foo"), then
 // the no memory is allocated and the returned slice is the original `mt`.
